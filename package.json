@@ -1,0 +1,9 @@
+{
+  "name": "mz-clientes",
+  "version": "1.0.0",
+  "description": "Sistema de gestão do escritório Melgarejo & Vargas Advocacia Trabalhista",
+  "private": true,
+  "engines": {
+    "node": ">=18.x"
+  }
+}
