@@ -6962,22 +6962,60 @@ function agTypeIcon(t){ return t==='prescricao'?'⏳':t==='audiencia'?'🏛️':
 
 // ── Cor e nome curto do dono de cada prazo ──
 // Cada pessoa (advogado ou assessor) tem uma cor só dela, sem repetir entre cargos.
-// A ordem segue a data de cadastro, então quem entra depois recebe uma cor nova
-// e as cores de quem já existe não mudam. Cinza fica reservado para "sem responsável".
-const AG_CORES_BASE = ['#C8102E','#1A5EC8','#0F8A5F','#D97706','#7C3AED','#0E7490','#DB2777','#65A30D','#92400E','#4338CA','#A21CAF','#CA8A04'];
+// As cores são escolhidas pela distância visual (espaço de cor CIELAB): cada pessoa,
+// na ordem de cadastro, recebe a cor mais diferente possível de todas as já usadas.
+// Assim quem entra depois não muda a cor de quem já existe. Cinza fica reservado
+// para "sem responsável", e cores próximas do cinza não entram na escolha.
 let _agCoresCache = { sig: '', mapa: {} };
+function _agHslRgb(h, s, l){
+  s /= 100; l /= 100;
+  const k = n => (n + h / 30) % 12, a = s * Math.min(l, 1 - l);
+  const f = n => l - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1)));
+  return [f(0), f(8), f(4)].map(x => Math.round(x * 255));
+}
+function _agRgbLab(rgb){
+  const lin = rgb.map(v => { v /= 255; return v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); });
+  const X = (lin[0]*0.4124 + lin[1]*0.3576 + lin[2]*0.1805) / 0.95047;
+  const Y = (lin[0]*0.2126 + lin[1]*0.7152 + lin[2]*0.0722);
+  const Z = (lin[0]*0.0193 + lin[1]*0.1192 + lin[2]*0.9505) / 1.08883;
+  const f = t => t > 0.008856 ? Math.cbrt(t) : 7.787 * t + 16/116;
+  return [116*f(Y) - 16, 500*(f(X) - f(Y)), 200*(f(Y) - f(Z))];
+}
+function _agLumin(rgb){ const c = rgb.map(v => { v /= 255; return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); }); return 0.2126*c[0] + 0.7152*c[1] + 0.0722*c[2]; }
+let _agCandidatas = null;
+function _agCandidatasCor(){
+  if (_agCandidatas) return _agCandidatas;
+  const out = [];
+  for (let h = 0; h < 360; h += 8) for (const l of [30, 38, 46]) for (const s of [85, 60]) {
+    const rgb = _agHslRgb(h, s, l);
+    if ((1.05) / (_agLumin(rgb) + 0.05) < 3.2) continue;            // precisa ser legível como texto sobre branco
+    const lab = _agRgbLab(rgb);
+    if (Math.hypot(lab[1], lab[2]) < 30) continue;                   // fora os tons acinzentados
+    out.push({ css: '#' + rgb.map(v => v.toString(16).padStart(2, '0')).join(''), lab });
+  }
+  return (_agCandidatas = out);
+}
 function agCorPessoa(chave){
   const pessoas = store.advogados.map(a => ({ k: 'adv:' + a.id, t: a.created_at || '' }))
     .concat(store.assessores.map(a => ({ k: 'ass:' + a.id, t: a.created_at || '' })))
     .sort((x, y) => String(x.t).localeCompare(String(y.t)) || x.k.localeCompare(y.k));
   const sig = pessoas.map(p => p.k).join('|');
   if (sig !== _agCoresCache.sig) {
-    const mapa = {};
+    const cand = _agCandidatasCor(), usadas = [], mapa = {};
+    const cinza = _agRgbLab([152,152,163]), vermelhoMarca = _agRgbLab([200,16,46]);
     pessoas.forEach((p, i) => {
-      mapa[p.k] = i < AG_CORES_BASE.length
-        ? AG_CORES_BASE[i]
-        // além da paleta: tons gerados pelo ângulo áureo, todos diferentes entre si
-        : `hsl(${Math.round((i * 137.508 + 23) % 360)}, ${62 - (i % 3) * 6}%, ${34 + (i % 4) * 5}%)`;
+      let melhor = null, melhorD = -Infinity;
+      cand.forEach(c => {
+        if (usadas.includes(c)) return;
+        // a primeira pessoa fica com o vermelho da marca; as demais, a cor mais distante de todas as usadas
+        const refs = usadas.length ? usadas.map(u => u.lab) : [vermelhoMarca];
+        let d = Math.min(...refs.map(r => Math.hypot(c.lab[0]-r[0], c.lab[1]-r[1], c.lab[2]-r[2])));
+        if (!usadas.length) d = -d;
+        d = Math.min(d, Math.hypot(c.lab[0]-cinza[0], c.lab[1]-cinza[1], c.lab[2]-cinza[2]) * 1.5);
+        if (d > melhorD) { melhorD = d; melhor = c; }
+      });
+      if (!melhor) melhor = { css: `hsl(${Math.round(i * 137.508) % 360}, 70%, 38%)`, lab: [0,0,0] };
+      usadas.push(melhor); mapa[p.k] = melhor.css;
     });
     _agCoresCache = { sig, mapa };
   }
