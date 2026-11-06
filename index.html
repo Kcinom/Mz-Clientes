@@ -356,6 +356,7 @@ body:has(#pre-screen[style*="flex"]) #app { display: none !important; }
 .block-head.ativo{background:var(--info-bg);border-color:var(--info)}
 .block-head.protocolado{background:var(--success-bg);border-color:var(--success)}
 .block-head.desistencia{background:var(--warn-bg);border-color:var(--warn)}
+.block-head.desistencia_cliente{background:var(--gray-100);border-color:var(--gray-400)}
 .block-head.prescrito,.block-head.rejeitado{background:var(--red-soft);border-color:var(--red)}
 .block-head.grouped{background:var(--gray-50);border-color:var(--gray-200)}
 .block-head h3{font-size:13px;font-weight:700;flex:1}
@@ -786,7 +787,8 @@ body:has(#pre-screen[style*="flex"]) #app { display: none !important; }
           <option value="pendente">Pendentes</option>
           <option value="ativo">Ativos</option>
           <option value="protocolado">Protocolados</option>
-          <option value="desistencia">Desistência</option>
+          <option value="desistencia">Desistência para reentrada</option>
+          <option value="desistencia_cliente">Desistência do cliente</option>
           <option value="prescrito">Prescritos</option>
           <option value="rejeitado">Rejeitados</option>
         </select>
@@ -1023,7 +1025,7 @@ body:has(#pre-screen[style*="flex"]) #app { display: none !important; }
         </div>
         <div class="form-divider"><span>Processo</span></div>
         <div class="field full"><label>Status</label>
-          <select id="c-status" onchange="onStatusChange()"><option value="ativo">✅ Ativo</option><option value="protocolado">📋 Protocolado</option><option value="desistencia">🚫 Desistência</option><option value="prescrito">❌ Prescrito</option></select>
+          <select id="c-status" onchange="onStatusChange()"><option value="ativo">✅ Ativo</option><option value="protocolado">📋 Protocolado</option><option value="desistencia">🔁 Desistência para reentrada</option><option value="desistencia_cliente">🚫 Desistência do cliente</option><option value="prescrito">❌ Prescrito</option></select>
         </div>
         <div id="bloco-proto" style="display:none;grid-column:1/-1">
           <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
@@ -1033,8 +1035,8 @@ body:has(#pre-screen[style*="flex"]) #app { display: none !important; }
         </div>
         <div id="bloco-desist" style="display:none;grid-column:1/-1">
           <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
-            <div class="info-box warn" style="grid-column:1/-1">⚠️ <span><strong>Desistência</strong> — nova prescrição = data de arquivamento + 2 anos.</span></div>
-            <div class="field"><label>Data de Arquivamento *</label><input type="date" id="c-data-arq" onchange="recalcPrescricao()"></div>
+            <div class="info-box warn" style="grid-column:1/-1" id="desist-info">⚠️ <span><strong>Desistência para reentrada</strong> — nova prescrição = data de arquivamento + 2 anos.</span></div>
+            <div class="field"><label id="desist-arq-lbl">Data de Arquivamento *</label><input type="date" id="c-data-arq" onchange="recalcPrescricao()"></div>
           </div>
         </div>
         <div class="field" id="adv-field"><label>Advogado Responsável</label><select id="c-adv"><option value="">— Sem atribuição —</option></select></div>
@@ -1962,6 +1964,8 @@ create table if not exists assessores (
   created_at timestamptz default now()
 );
 alter table assessores disable row level security;
+-- Permissões do assessor (inclui a quais advogados ele tem acesso aos clientes)
+alter table assessores add column if not exists perms jsonb default '{}'::jsonb;
 
 -- Agenda de prazos/tarefas (separada do módulo "tarefas")
 -- escopo = 'assessores' (compartilhada, sem advogado) | 'advogado' (particular do adv)
@@ -2243,7 +2247,12 @@ const store = {
 
   forUser(u) {
     if (!u) return [];
-    if (u.tipo === 'admin' || u.tipo === 'assessor') return this.clientes;
+    if (u.tipo === 'admin') return this.clientes;
+    if (u.tipo === 'assessor') {
+      // Admin pode limitar a quais advogados o assessor tem acesso
+      const s = advsVisiveisDe(u);
+      return s ? this.clientes.filter(c => s.has(c.adv_id || 'none')) : this.clientes;
+    }
     if (u.tipo === 'advogado') return this.clientes.filter(c => c.adv_id === u.advId && !['pendente','rejeitado'].includes(c.status));
     if (u.tipo === 'secretaria') {
       if (u.perms?.canViewAllClients) return this.clientes;
@@ -2251,8 +2260,10 @@ const store = {
       return this.clientes.filter(c => mine.has(c.id));
     }
     if (u.tipo === 'estagiario') {
-      // Pode ver clientes designados pelo adv responsável
-      return this.clientes.filter(c => c.adv_id === u.advId && !['pendente','rejeitado'].includes(c.status));
+      // Por padrão vê os clientes do advogado responsável; o admin pode liberar outros advogados
+      const s = advsVisiveisDe(u);
+      const base = this.clientes.filter(c => !['pendente','rejeitado'].includes(c.status));
+      return s ? base.filter(c => s.has(c.adv_id || 'none')) : base;
     }
     if (u.tipo === 'estagiario_chefe') {
       // Pode ver todos se permissão
@@ -2312,8 +2323,8 @@ const fmtDT = iso => { if (!iso) return '—'; const d = new Date(iso); return d
 const addYears = (ds, n) => { if (!ds) return ''; const d = new Date(ds); d.setFullYear(d.getFullYear() + n); return d.toISOString().split('T')[0]; };
 const TIPO_MAP = { ainda_trabalhando: 'Ainda na Empresa', rescisao_indireta: 'Rescisão Indireta', dispensa_sem_justa_causa: 'Dispensa s/ JC', dispensa_com_justa_causa: 'Dispensa c/ JC', pedido_demissao: 'Pedido Demissão', acordo_mutuo: 'Acordo Mútuo', aposentadoria: 'Aposentadoria', falecimento: 'Falecimento' };
 const fmtTipo = t => TIPO_MAP[t] || t || '—';
-const fmtStatus = s => ({ ativo: 'Ativo', protocolado: 'Protocolado', desistencia: 'Desistência', prescrito: 'Prescrito', pendente: 'Pendente', rejeitado: 'Rejeitado' }[s] || s);
-const stBadge = s => ({ ativo: 'b-info', protocolado: 'b-green', desistencia: 'b-warn', prescrito: 'b-red', pendente: 'b-orange', rejeitado: 'b-red' }[s] || 'b-gray');
+const fmtStatus = s => ({ ativo: 'Ativo', protocolado: 'Protocolado', desistencia: 'Desistência p/ reentrada', desistencia_cliente: 'Desistência do cliente', prescrito: 'Prescrito', pendente: 'Pendente', rejeitado: 'Rejeitado' }[s] || s);
+const stBadge = s => ({ ativo: 'b-info', protocolado: 'b-green', desistencia: 'b-warn', desistencia_cliente: 'b-gray', prescrito: 'b-red', pendente: 'b-orange', rejeitado: 'b-red' }[s] || 'b-gray');
 const advNome = id => { if (!id) return '—'; const a = store.getAdv(id); return a ? a.nome : '—'; };
 const AUDIT_LABELS = { pre_entrevista: { lbl: 'Pré-entrevista', bg: '#f0ebff', col: '#7C3AED' }, aprovado: { lbl: 'Aprovado', bg: '#E4F5EC', col: '#1A8C4E' }, rejeitado: { lbl: 'Rejeitado', bg: '#F9E5E8', col: '#C8102E' }, protocolado: { lbl: 'Protocolado', bg: '#E4F5EC', col: '#1A8C4E' }, criado: { lbl: 'Cadastrado', bg: '#E5EEFB', col: '#1A5EC8' }, editado: { lbl: 'Editado', bg: '#EBEBED', col: '#5A5A65' }, excluido: { lbl: 'Excluído', bg: '#F9E5E8', col: '#C8102E' }, link_gerado: { lbl: 'Link gerado', bg: '#FFF4E0', col: '#E07B00' } };
 
@@ -2344,7 +2355,7 @@ function urgencia(c) {
   // Prioridade MANUAL (secretária/admin) em processos NÃO protocolados — independe da prescrição
   const manual = c.status !== 'protocolado' ? (c.prioridade_manual || '') : '';
   if (manual === 'critica') return 1;
-  if (['protocolado','prescrito','pendente','rejeitado'].includes(c.status)) return 4;
+  if (['protocolado','prescrito','pendente','rejeitado','desistencia_cliente'].includes(c.status)) return 4;
   if (c.tipo_rescisao === 'rescisao_indireta') return 1;
   if (c.gravida || c.acidente || c.doenca || c.estabilidade) return 1;
   if (manual === 'alta') return 2;
@@ -2578,6 +2589,9 @@ async function doLogin() {
         } else if (profile.tipo === 'secretaria' && profile.ref_id) {
           const { data: s } = await sb.from('secretarias').select('*').eq('id', profile.ref_id).maybeSingle();
           if (s) { currentUser.perms = s.perms || {}; }
+        } else if (profile.tipo === 'assessor' && profile.ref_id) {
+          const { data: as } = await sb.from('assessores').select('*').eq('id', profile.ref_id).maybeSingle();
+          if (as) { currentUser.perms = as.perms || {}; }
         } else if (profile.tipo === 'estagiario_chefe' && profile.ref_id) {
           const { data: ec } = await sb.from('estagiarios_chefes').select('*').eq('id', profile.ref_id).maybeSingle();
           if (ec) { currentUser.perms = ec.perms || {}; }
@@ -2629,7 +2643,7 @@ async function doLogin() {
   const { data: asss } = await sb.from('assessores').select('*').eq('email', email).eq('senha', pwd);
   if (asss && asss.length) {
     const as = asss[0];
-    currentUser = { tipo: 'assessor', nome: as.nome, email: as.email, id: as.id, advId: null };
+    currentUser = { tipo: 'assessor', nome: as.nome, email: as.email, id: as.id, advId: null, perms: as.perms || {} };
     await bootApp(); return;
   }
 
@@ -2783,6 +2797,12 @@ async function bootApp() {
   loading(true, 'Carregando dados…');
   await store.load();
   loading(false);
+  // Atualiza permissões da sessão salva (o admin pode ter mudado desde o último acesso)
+  try {
+    if (currentUser.tipo === 'assessor') { const r = store.getAssessor(currentUser.id); if (r) currentUser.perms = r.perms || {}; }
+    if (currentUser.tipo === 'estagiario') { const r = store.getEst(currentUser.id); if (r) { currentUser.perms = r.perms || {}; currentUser.advId = r.adv_id; } }
+    localStorage.setItem('mz_sessao', JSON.stringify(currentUser));
+  } catch(e) {}
 
   $('login-screen').style.display = 'none';
   $('app').style.display = 'block';
@@ -3121,7 +3141,7 @@ async function salvarNovasCredenciais() {
 }
 
 function updateBadges() {
-  const pend = store.clientes.filter(c => c.status === 'pendente').length;
+  const pend = (currentUser && currentUser.tipo === 'assessor' ? store.forUser(currentUser) : store.clientes).filter(c => c.status === 'pendente').length;
   const nb = $('nb-pend');
   if (nb) { if (pend > 0) { nb.textContent = pend; nb.style.display = ''; } else nb.style.display = 'none'; }
   const openToks = store.tokens.filter(t => !t.usado).length;
@@ -3177,7 +3197,7 @@ async function renderDashboard() {
   const ativos = all.filter(c => c.status === 'ativo');
   const proto  = all.filter(c => c.status === 'protocolado');
   const crit   = all.filter(c => urgencia(c) === 1 && c.status === 'ativo');
-  const pend   = store.clientes.filter(c => c.status === 'pendente');
+  const pend   = (currentUser.tipo === 'assessor' ? all : store.clientes).filter(c => c.status === 'pendente');
 
   $('stats-row').innerHTML = `
     <div class="stat-card"><div class="stat-icon" style="background:var(--gray-50)"><svg width="20" height="20" fill="none" stroke="var(--gray-600)" stroke-width="2" viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg></div><div><h3>${all.length}</h3><p>Total de Clientes</p></div></div>
@@ -3340,12 +3360,14 @@ function renderClients() {
   const ativ  = list.filter(c => c.status === 'ativo');
   const prot  = list.filter(c => c.status === 'protocolado');
   const des   = list.filter(c => c.status === 'desistencia');
+  const desC  = list.filter(c => c.status === 'desistencia_cliente');
   const presc = list.filter(c => c.status === 'prescrito');
   const rej   = list.filter(c => c.status === 'rejeitado');
   if (pend.length)  html += statusBlock('pendente',   'Pendentes de Aprovação',  pend,  'Recebido em');
   if (ativ.length)  html += statusBlock('ativo',       'Em Andamento',           ativ,  'Prescrição');
   if (prot.length)  html += statusBlock('protocolado', 'Protocolados',           prot,  'Protocolado em');
-  if (des.length)   html += statusBlock('desistencia', 'Desistência / Arquivados', des, 'Nova Prescrição');
+  if (des.length)   html += statusBlock('desistencia', 'Desistência para reentrada', des, 'Nova Prescrição');
+  if (desC.length)  html += statusBlock('desistencia_cliente', 'Desistência do cliente', desC, 'Arquivado em');
   if (presc.length) html += statusBlock('prescrito',   'Prescritos',             presc, 'Prescrição');
   if (rej.length)   html += statusBlock('rejeitado',   'Rejeitados',             rej,   'Motivo');
   cont.innerHTML = html;
@@ -3384,6 +3406,8 @@ function clientRow(c, ost) {
     col4 = `<div class="cell-sm">${fmtDT(c.criado_em)}</div>`;
   } else if (st === 'protocolado') {
     col4 = `<div class="cell-sm">${fmtDate(c.data_protocolo)}</div><div class="cell-xs" style="color:var(--success)">Ajuizado ✔</div>`;
+  } else if (st === 'desistencia_cliente') {
+    col4 = `<div class="cell-sm">${fmtDate(c.data_arquivamento)}</div><div class="cell-xs">Encerrado pelo cliente</div>`;
   } else if (st === 'rejeitado') {
     col4 = `<div class="cell-sm" style="color:var(--red)">${c.motivo_rejeicao ? c.motivo_rejeicao.substring(0, 30) + '…' : '—'}</div>`;
   } else {
@@ -3721,8 +3745,15 @@ async function confirmProtocolar() {
 function onStatusChange() {
   const st = $('c-status').value;
   $('bloco-proto').style.display  = st === 'protocolado' ? 'block' : 'none';
-  $('bloco-desist').style.display = st === 'desistencia' ? 'block' : 'none';
-  if (st !== 'desistencia') $('c-data-arq').value = '';
+  const ehDesist = st === 'desistencia' || st === 'desistencia_cliente';
+  $('bloco-desist').style.display = ehDesist ? 'block' : 'none';
+  if (!ehDesist) $('c-data-arq').value = '';
+  if (ehDesist) {
+    $('desist-info').innerHTML = st === 'desistencia'
+      ? '⚠️ <span><strong>Desistência para reentrada</strong> — nova prescrição = data de arquivamento + 2 anos. Continua na agenda e nos avisos de prescrição.</span>'
+      : '🚫 <span><strong>Desistência do cliente</strong> — caso encerrado a pedido do cliente. Sai da agenda, dos avisos e das urgências de prescrição.</span>';
+    $('desist-arq-lbl').textContent = st === 'desistencia' ? 'Data de Arquivamento *' : 'Data de Arquivamento';
+  }
   recalcPrescricao();
 }
 function recalcPrescricao() {
@@ -3896,6 +3927,10 @@ function openDetail(id) {
           <div class="ds-item"><label>Prescrição original</label><span style="text-decoration:line-through;color:var(--gray-400)">${fmtDate(addYears(c.data_rescisao, 2))}</span></div>
           <div class="ds-item"><label>Nova Prescrição</label><span style="font-weight:700;color:var(--warn)">${fmtDate(c.data_prescricao)}</span></div>
           <div class="ds-item"><label>Dias restantes</label><span>${ds}</span></div>`;
+  } else if (c.status === 'desistencia_cliente') {
+    pb = `<div class="ds-item"><label>Situação</label><span style="font-weight:600;color:var(--gray-600)">Desistência do cliente: caso encerrado</span></div>
+          <div class="ds-item"><label>Data de Arquivamento</label><span>${fmtDate(c.data_arquivamento)}</span></div>
+          <div class="ds-item"><label>Prescrição</label><span style="color:var(--gray-400)">Não acompanhada</span></div>`;
   } else if (c.status === 'pendente') {
     pb = `<div class="ds-item"><label>Status</label><span style="color:var(--orange)">Aguardando aprovação</span></div><div class="ds-item"><label>Recebido em</label><span>${fmtDT(c.criado_em)}</span></div>`;
   } else if (c.status === 'rejeitado') {
@@ -4210,12 +4245,14 @@ function renderEstagiarios() {
           <div style="margin-top:4px;display:flex;gap:4px;flex-wrap:wrap">
             <span class="role-chip role-estagiario">Estagiário</span>
           </div></div></div>
+      <div style="font-size:11px;color:var(--gray-600);margin:-6px 0 10px">👁 Vê clientes de: <strong>${escHtml(resumoAdvsVisiveis({ tipo:'estagiario', advId:e.adv_id, perms:e.perms }))}</strong></div>
       <div class="adv-stats">
         <div class="adv-stat"><strong>${adv ? adv.nome.split(' ')[0] : 'N/A'}</strong><span>Advogado resp.</span></div>
         <div class="adv-stat"><strong style="color:var(--info)">${store.clientes.filter(c => c.adv_id === e.adv_id).length}</strong><span>Clientes do adv</span></div>
       </div>
       <div class="adv-card-ft" style="display:flex;gap:6px;flex-wrap:wrap">
         <button class="btn btn-ghost btn-sm" style="flex:1;min-width:90px" onclick="openEditEst('${e.id}')">✏️ Editar</button>
+        ${currentUser.tipo === 'admin' ? `<button class="btn btn-ghost btn-sm" onclick="abrirAdvsVisiveis('estagiario','${e.id}')" title="Clientes de quais advogados pode ver">🔐 Advogados</button>` : ''}
         <button class="btn btn-danger-soft btn-sm" style="width:40px;padding:0;flex-shrink:0" onclick="confirmDelEst('${e.id}')" title="Excluir">🗑️</button>
       </div>
     </div>`;
@@ -6434,6 +6471,105 @@ async function initAdvise() {
 function hideDjNotif() {}
 
 // ══════════════════════════════════════════════════════════════════
+// ░░ ACESSO A CLIENTES POR ADVOGADO (assessores e estagiários) ░░
+// O admin escolhe, no login de cada assessor e estagiário, de quais
+// advogados ele pode ver os clientes. perms.advsVisiveis:
+//   ausente → padrão (assessor: todos; estagiário: só o advogado responsável)
+//   null    → todos os advogados, inclusive os cadastrados depois
+//   [ids]   → só esses advogados ('none' = clientes sem advogado)
+// ══════════════════════════════════════════════════════════════════
+function advsVisiveisDe(u){
+  if (!u) return null;
+  const v = u.perms ? u.perms.advsVisiveis : undefined;
+  if (u.tipo === 'assessor') return Array.isArray(v) ? new Set(v) : null;
+  if (u.tipo === 'estagiario') {
+    if (v === null) return null;
+    if (Array.isArray(v)) return new Set(v);
+    return new Set(u.advId ? [u.advId] : []);
+  }
+  return null;
+}
+function resumoAdvsVisiveis(u){
+  const s = advsVisiveisDe(u);
+  if (!s) return 'todos os advogados';
+  if (!s.size) return 'nenhum advogado';
+  const nomes = [...s].map(id => id === 'none' ? 'sem advogado' : ((store.getAdv(id) || {}).nome || '').split(' ').slice(0, 2).join(' ')).filter(Boolean);
+  return nomes.length > 3 ? nomes.slice(0, 3).join(', ') + ` e mais ${nomes.length - 3}` : nomes.join(', ');
+}
+
+let _advVisAlvo = null;
+function abrirAdvsVisiveis(tipo, id){
+  if (!currentUser || currentUser.tipo !== 'admin') { toast('⛔ Apenas o administrador define esse acesso'); return; }
+  const reg = tipo === 'assessor' ? store.getAssessor(id) : store.getEst(id);
+  if (!reg) return;
+  _advVisAlvo = { tipo, id };
+  const s = advsVisiveisDe({ tipo, advId: reg.adv_id, perms: reg.perms || {} });
+  const todos = !s;
+  const opcoes = store.advogados.map(a => ({ id: a.id, lbl: '⚖️ ' + a.nome + (tipo === 'estagiario' && a.id === reg.adv_id ? ' (responsável)' : '') }))
+    .concat([{ id: 'none', lbl: '📂 Clientes sem advogado atribuído' + (tipo === 'assessor' ? ' (inclui pré-entrevistas pendentes)' : '') }]);
+  const marcado = o => todos || s.has(o.id);
+  let m = $('modal-adv-vis'); if (m) m.remove();
+  m = document.createElement('div');
+  m.className = 'overlay'; m.id = 'modal-adv-vis';
+  m.innerHTML = `<div class="modal" style="max-width:560px">
+    <div class="modal-hd"><div><h2>🔐 Acesso a clientes por advogado</h2><p>${escHtml(reg.nome)} · ${tipo === 'assessor' ? 'Assessor(a)' : 'Estagiário(a)'}</p></div>
+      <button class="btn-icon-sq" onclick="closeModal('modal-adv-vis')"><svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+    </div>
+    <div class="modal-body">
+      <div class="info-box info" style="margin-bottom:14px">👁 <span>Define de quais advogados este login vê os <strong>clientes</strong> (lista, painel, fichas e avisos de prescrição). A agenda de prazos continua como está.</span></div>
+      <div class="perm-row" style="margin-bottom:14px">
+        <div class="perm-row-info"><h5>Todos os advogados</h5><p>Inclusive os que forem cadastrados depois.</p></div>
+        <button class="toggle ${todos ? 'on' : ''}" id="advvis-todos" onclick="this.classList.toggle('on');_advVisToggleTodos()"></button>
+      </div>
+      <div id="advvis-lista" style="${todos ? 'opacity:.45;pointer-events:none' : ''}">
+        <div style="display:flex;gap:8px;margin-bottom:10px">
+          <button class="btn btn-ghost btn-sm" onclick="document.querySelectorAll('#advvis-pills input').forEach(i=>i.checked=true)">Marcar todos</button>
+          <button class="btn btn-ghost btn-sm" onclick="document.querySelectorAll('#advvis-pills input').forEach(i=>i.checked=false)">Desmarcar todos</button>
+        </div>
+        <div class="checkbox-group" id="advvis-pills">${opcoes.map(o => `<label class="check-pill"><input type="checkbox" value="${o.id}" ${marcado(o) ? 'checked' : ''}><div class="dot"></div>${escHtml(o.lbl)}</label>`).join('')}</div>
+      </div>
+    </div>
+    <div class="modal-ft">
+      <button class="btn btn-ghost" onclick="closeModal('modal-adv-vis')">Cancelar</button>
+      <button class="btn btn-red" id="btn-save-advvis" onclick="salvarAdvsVisiveis()">Salvar</button>
+    </div>
+  </div>`;
+  m.addEventListener('click', e => { if (e.target === m) m.classList.remove('open'); });
+  document.body.appendChild(m);
+  openModal('modal-adv-vis');
+}
+function _advVisToggleTodos(){
+  const on = $('advvis-todos').classList.contains('on');
+  const l = $('advvis-lista'); l.style.opacity = on ? '.45' : '1'; l.style.pointerEvents = on ? 'none' : '';
+}
+async function salvarAdvsVisiveis(){
+  if (!_advVisAlvo || currentUser.tipo !== 'admin') return;
+  const { tipo, id } = _advVisAlvo;
+  const tabela = tipo === 'assessor' ? 'assessores' : 'estagiarios';
+  const reg = tipo === 'assessor' ? store.getAssessor(id) : store.getEst(id);
+  if (!reg) return;
+  const todos = $('advvis-todos').classList.contains('on');
+  const sel = [...document.querySelectorAll('#advvis-pills input:checked')].map(i => i.value);
+  if (!todos && !sel.length && !confirm('Nenhum advogado marcado: este login não verá nenhum cliente. Confirmar?')) return;
+  const perms = { ...(reg.perms || {}), advsVisiveis: todos ? null : sel };
+  btnLoad('btn-save-advvis', true);
+  const { error } = await sb.from(tabela).update({ perms }).eq('id', id);
+  if (error) {
+    btnLoad('btn-save-advvis', false);
+    const faltaColuna = /perms/i.test(error.message || '') && tipo === 'assessor';
+    toast(faltaColuna
+      ? '❌ Falta a coluna de permissões dos assessores. No Supabase, SQL Editor, rode: alter table assessores add column if not exists perms jsonb default \'{}\'::jsonb;'
+      : '❌ Erro ao salvar: ' + error.message);
+    return;
+  }
+  try { store.addAudit('editado', null, null, `Acesso a clientes de ${reg.nome} (${tipo}): ${todos ? 'todos os advogados' : sel.length + ' opção(ões)'}`); } catch(e){}
+  await store.reload([tabela]);
+  closeModal('modal-adv-vis');
+  if (tipo === 'assessor') renderAssessores(); else renderEstagiarios();
+  toast('✅ Acesso atualizado. Vale no próximo carregamento da página do usuário.');
+}
+
+// ══════════════════════════════════════════════════════════════════
 // ░░ ASSESSORES — CRUD (admin) ░░
 // ══════════════════════════════════════════════════════════════════
 let editAssessorId = null;
@@ -6448,8 +6584,10 @@ function renderAssessores() {
       <div class="adv-stats">
         <div class="adv-stat"><strong style="color:var(--purple)">${abertos}</strong><span>Prazos em aberto (grupo)</span></div>
       </div>
+      <div style="font-size:11px;color:var(--gray-600);margin:-4px 0 12px">👁 Vê clientes de: <strong>${escHtml(resumoAdvsVisiveis({ tipo:'assessor', perms:a.perms }))}</strong></div>
       <div class="adv-card-ft">
         <button class="btn btn-ghost btn-sm" style="flex:1" onclick="openEditAssessor('${a.id}')">✏️ Editar</button>
+        <button class="btn btn-ghost btn-sm" onclick="abrirAdvsVisiveis('assessor','${a.id}')" title="Clientes de quais advogados pode ver">🔐 Advogados</button>
         <button class="btn btn-danger-soft btn-sm" onclick="confirmDelAssessor('${a.id}')">🗑️</button>
       </div>
     </div>`;
@@ -6616,11 +6754,40 @@ function agAplicarModoTrabalho(){
 function agItemsFor(v){
   if (!v) return [];
   if (v.scope === 'trabalhos') return store.agenda.filter(t => t.escopo === 'trabalhos');
-  if (v.scope === 'todas') return store.agenda.filter(t => t.escopo !== 'trabalhos');
+  if (v.scope === 'todas') return store.agenda.filter(t => t.escopo !== 'trabalhos').concat(agPrescricoesFor(v));
   if (v.scope === 'audiencias') return store.agenda.filter(t => t.tipo === 'audiencia' || t.tipo === 'cliente');
   if (v.scope === 'assessor') return store.agenda.filter(t => t.escopo === 'assessores' && t.assessor_id === v.assessorId);
-  if (v.scope === 'assessores') return store.agenda.filter(t => t.escopo === 'assessores');
-  return store.agenda.filter(t => t.escopo === 'advogado' && t.adv_id === v.advId);
+  if (v.scope === 'assessores') return store.agenda.filter(t => t.escopo === 'assessores').concat(agPrescricoesFor(v));
+  return store.agenda.filter(t => t.escopo === 'advogado' && t.adv_id === v.advId).concat(agPrescricoesFor(v));
+}
+
+// ── Prescrições na agenda (automático, calculado dos clientes) ──
+// Cliente ainda não protocolado (ativo, pendente ou desistência) com data de prescrição
+// aparece na agenda do advogado responsável; sem advogado, na agenda dos assessores.
+// Não é gravado na tabela da agenda: some sozinho quando o cliente é protocolado,
+// e muda de dia se a data de prescrição mudar na ficha.
+function agMostrarPresc(){ try { return localStorage.getItem('mz_ag_presc') !== '0'; } catch(e){ return true; } }
+function agTogglePresc(on){ try { localStorage.setItem('mz_ag_presc', on ? '1' : '0'); } catch(e){} renderAgenda(); }
+function agPrescricoesFor(v){
+  if (!v || !agMostrarPresc() || !currentUser) return [];
+  if (!['todas','advogado','assessores'].includes(v.scope)) return [];
+  const visiveis = store.forUser(currentUser);          // respeita o acesso a clientes de cada login
+  const hoje0 = new Date(); hoje0.setHours(0,0,0,0);
+  return visiveis
+    .filter(c => ['ativo','pendente','desistencia'].includes(c.status) && /^\d{4}-\d{2}-\d{2}$/.test(c.data_prescricao || ''))
+    .filter(c => v.scope === 'todas' || (v.scope === 'advogado' ? c.adv_id === v.advId : !c.adv_id))
+    .map(c => {
+      const dias = Math.round((new Date(c.data_prescricao + 'T00:00:00') - hoje0) / 86400000);
+      return {
+        id: 'presc:' + c.id, _presc: true, _clienteId: c.id, _dias: dias,
+        titulo: 'Prescrição — ' + c.nome,
+        tipo: 'prescricao', data: c.data_prescricao, hora: '',
+        status: 'aberta', prioridade: dias <= 30 ? 'alta' : 'normal',
+        escopo: c.adv_id ? 'advogado' : 'assessores', adv_id: c.adv_id || null, assessor_id: null,
+        assunto: c.reclamada ? 'x ' + c.reclamada : '',
+        _desist: c.status === 'desistencia', _pend: c.status === 'pendente'
+      };
+    });
 }
 // Rótulo do dono do prazo (de quem é a agenda)
 function agOwnerLabel(item){
@@ -6676,7 +6843,7 @@ function agCanEdit(item){
 // Só prazos de advogado podem ser rejeitados (vão p/ assessores). Ninguém apaga.
 // Rejeitar é só admin e o próprio advogado (estagiários/chefes/secretária podem lançar, mas não rejeitam).
 function agCanReject(item){
-  if (!currentUser || item.escopo !== 'advogado') return false;
+  if (!currentUser || item._presc || item.escopo !== 'advogado') return false;
   if (['secretaria','estagiario','estagiario_chefe'].includes(currentUser.tipo)) return false;
   return agCanEdit(item);
 }
@@ -6694,13 +6861,16 @@ function renderAgenda(){
 
   if (v.scope === 'trabalhos'){ renderTrabalhos(v, selector); return; }
 
-  const end = agAddDays(agendaWeekStart, 6);
-  const weekLbl = `${agendaWeekStart.toLocaleDateString('pt-BR',{day:'2-digit',month:'short'})} – ${end.toLocaleDateString('pt-BR',{day:'2-digit',month:'short',year:'numeric'})}`;
+  // Página = 15 dias úteis a partir de agendaWeekStart (fins de semana e feriados só aparecem se tiverem prazo)
+  const pag = agPaginaDias(agendaWeekStart);
+  const uteisPag = pag.filter(x => x.util);
+  const ini = uteisPag[0].date, fimUtil = uteisPag[uteisPag.length - 1].date;
+  const weekLbl = `${ini.toLocaleDateString('pt-BR',{day:'2-digit',month:'short'})} – ${fimUtil.toLocaleDateString('pt-BR',{day:'2-digit',month:'short',year:'numeric'})} · ${AG_DIAS_PAGINA} dias úteis`;
 
   // estatísticas
   const items = agItemsFor(v);
   const today = new Date(); today.setHours(0,0,0,0);
-  const wkStartISO = agISO(agendaWeekStart), wkEndISO = agISO(agAddDays(agendaWeekStart,5));
+  const wkStartISO = agISO(pag[0].date), wkEndISO = agISO(pag[pag.length - 1].date);
   const wk = items.filter(t => t.data >= wkStartISO && t.data <= wkEndISO);
   const abertas = wk.filter(t => t.status !== 'concluida').length;
   const feitas  = wk.filter(t => t.status === 'concluida').length;
@@ -6724,18 +6894,19 @@ function renderAgenda(){
       <div class="ag-left">
         ${selector}
         <div class="ag-nav">
-          <button class="btn btn-ghost btn-sm" onclick="agPrevWk()">‹</button>
+          <button class="btn btn-ghost btn-sm" onclick="agPrevWk()" title="${AG_DIAS_PAGINA} dias úteis anteriores">‹</button>
           <button class="btn btn-ghost btn-sm" onclick="agToday()">Hoje</button>
-          <button class="btn btn-ghost btn-sm" onclick="agNextWk()">›</button>
+          <button class="btn btn-ghost btn-sm" onclick="agNextWk()" title="Próximos ${AG_DIAS_PAGINA} dias úteis">›</button>
         </div>
         <span class="ag-weeklabel">${weekLbl}</span>
       </div>
       <div class="ag-right">
+        ${['todas','advogado','assessores'].includes(v.scope) ? `<label style="display:flex;gap:6px;align-items:center;font-size:12px;font-weight:600;color:var(--gray-600);cursor:pointer;margin-right:6px"><input type="checkbox" style="width:auto" ${agMostrarPresc() ? 'checked' : ''} onchange="agTogglePresc(this.checked)"> ⏳ Prescrições</label>` : ''}
         <button class="btn btn-red btn-sm" onclick="openNewAgenda()"><svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>Novo prazo</button>
       </div>
     </div>
     <div class="ag-stats">
-      <div class="ag-stat"><div class="n">${wk.length}</div><div class="l">Na semana</div></div>
+      <div class="ag-stat"><div class="n">${wk.length}</div><div class="l">No período</div></div>
       <div class="ag-stat"><div class="n" style="color:var(--orange)">${abertas}</div><div class="l">Em aberto</div></div>
       <div class="ag-stat"><div class="n" style="color:var(--success)">${feitas}</div><div class="l">Concluídas</div></div>
       <div class="ag-stat"><div class="n" style="color:var(--red)">${atras}</div><div class="l">Atrasadas</div></div>
@@ -6743,26 +6914,66 @@ function renderAgenda(){
     <div class="ag-week" id="ag-week"></div>`;
 
   const wkEl = $('ag-week');
-  for (let i=0; i<6; i++){
-    const date = agAddDays(agendaWeekStart, i), dow = date.getDay(), iso = agISO(date);
+  wkEl.className = 'ag-pagina';
+  // Agrupa os dias da página em linhas por semana
+  const semanas = [];
+  pag.forEach(x => {
+    const iso = agISO(x.date);
     const dayItems = items.filter(t => t.data === iso).sort((a,b)=>(a.hora||'99:99').localeCompare(b.hora||'99:99'));
-    const col = document.createElement('div');
-    col.className = 'ag-day' + (agSameDay(date,today)?' today':'');
-    col.innerHTML = `<div class="ag-day-hd"><span>${AG_DAYS[dow]} <small>${date.toLocaleDateString('pt-BR',{day:'2-digit',month:'2-digit'})}</small></span><span class="ag-cnt">${dayItems.length}</span></div>`;
-    const list = document.createElement('div'); list.className = 'ag-cards';
-    if (!dayItems.length) list.innerHTML = '<div class="ag-empty">—</div>';
-    dayItems.forEach(t => list.appendChild(agCard(t, today)));
-    col.appendChild(list);
-    const add = document.createElement('div'); add.className='ag-add'; add.textContent='+ prazo';
-    add.onclick = () => openNewAgenda(iso);
-    col.appendChild(add);
-    wkEl.appendChild(col);
-  }
+    if (!x.util && !dayItems.length) return;          // fim de semana/feriado vazio não aparece
+    const chave = agISO(agMonday(x.date));
+    let s = semanas.find(w => w.chave === chave);
+    if (!s) { s = { chave, dias: [] }; semanas.push(s); }
+    s.dias.push({ ...x, iso, dayItems });
+  });
+  semanas.forEach(s => {
+    const lbl = document.createElement('div'); lbl.className = 'ag-wklbl';
+    const seg = new Date(s.chave + 'T12:00:00');
+    lbl.textContent = 'Semana de ' + seg.toLocaleDateString('pt-BR', { day:'2-digit', month:'2-digit' });
+    wkEl.appendChild(lbl);
+    const row = document.createElement('div'); row.className = 'ag-wkrow';
+    row.style.setProperty('--n', Math.max(5, s.dias.length));
+    s.dias.forEach(({ date, util, iso, dayItems }) => {
+      const dow = date.getDay();
+      const fer = !util && dow !== 0 && dow !== 6;
+      const col = document.createElement('div');
+      col.className = 'ag-day' + (agSameDay(date,today)?' today':'') + (util?'':' naoutil');
+      col.innerHTML = `<div class="ag-day-hd"><span>${AG_DAYS[dow]} <small>${date.toLocaleDateString('pt-BR',{day:'2-digit',month:'2-digit'})}${fer ? ' · feriado' : (!util ? ' · fim de semana' : '')}</small></span><span class="ag-cnt">${dayItems.length}</span></div>`;
+      const list = document.createElement('div'); list.className = 'ag-cards';
+      if (!dayItems.length) list.innerHTML = '<div class="ag-empty">—</div>';
+      dayItems.forEach(t => list.appendChild(agCard(t, today)));
+      col.appendChild(list);
+      const add = document.createElement('div'); add.className='ag-add'; add.textContent='+ prazo';
+      add.onclick = () => openNewAgenda(iso);
+      col.appendChild(add);
+      row.appendChild(col);
+    });
+    wkEl.appendChild(row);
+  });
   const nb = $('nb-agenda');
   if (nb){ const tot = items.filter(t=>t.status!=='concluida').length; nb.textContent = tot; nb.style.display = tot? '' : 'none'; }
 }
-function agTypeIcon(t){ return t==='audiencia'?'🏛️':t==='cliente'?'👤':t==='reuniao'?'👥':t==='admin'?'🗂️':'⚖️'; }
+function agTypeIcon(t){ return t==='prescricao'?'⏳':t==='audiencia'?'🏛️':t==='cliente'?'👤':t==='reuniao'?'👥':t==='admin'?'🗂️':'⚖️'; }
+function agCardPresc(t, today){
+  const el = document.createElement('div');
+  const venc = t._dias < 0;
+  el.className = 'ag-card ag-presc' + (venc ? ' venc' : '');
+  el.style.borderLeftColor = t._dias <= 30 ? 'var(--red)' : 'var(--warn)';
+  const dono = t.adv_id ? '⚖️ ' + ((store.getAdv(t.adv_id) || {}).nome || 'Advogado') : '📂 Sem advogado';
+  const prazo = venc ? `<span class="ag-late">⚠ prescrito há ${Math.abs(t._dias)}d sem protocolo</span>`
+              : t._dias === 0 ? '<span class="ag-late">⚠ prescreve HOJE</span>'
+              : `<span class="ag-tag" style="background:var(--red-soft);color:var(--red)">faltam ${t._dias}d</span>`;
+  const extra = t._pend ? '<span class="ag-tag st-pendente">pré-entrevista pendente</span>'
+              : t._desist ? '<span class="ag-tag" style="background:var(--warn-bg);color:var(--warn)">desistência p/ reentrada</span>'
+              : '<span class="ag-tag" style="background:var(--gray-100);color:var(--gray-600)">sem protocolo</span>';
+  el.innerHTML = `<div class="ag-t">⏳ ${escHtml(t.titulo)}</div>
+    <div class="ag-meta"><span class="ag-who" style="color:var(--red)">${escHtml(dono)}</span>${prazo}${extra}${t.assunto ? `<span class="ag-tag" style="background:var(--info-bg);color:var(--info)">${escHtml(t.assunto)}</span>` : ''}</div>`;
+  el.title = 'Prescrição automática, tirada da ficha do cliente. Clique para abrir a ficha.';
+  el.onclick = () => openDetail(t._clienteId);
+  return el;
+}
 function agCard(t, today){
+  if (t._presc) return agCardPresc(t, today);
   const el = document.createElement('div');
   const due = t.data ? new Date(t.data+'T'+(t.hora||'23:59')) : null;
   const late = due && t.status!=='concluida' && due < today && !agSameDay(due, today);
@@ -6783,8 +6994,30 @@ function agCard(t, today){
   el.onclick = () => openEditAgenda(t.id);
   return el;
 }
-function agPrevWk(){ agendaWeekStart = agAddDays(agendaWeekStart,-7); renderAgenda(); }
-function agNextWk(){ agendaWeekStart = agAddDays(agendaWeekStart, 7); renderAgenda(); }
+// ── Paginação da agenda: 15 dias úteis por página ──
+const AG_DIAS_PAGINA = 15;
+// Dia útil da agenda: segunda a sexta, fora feriados nacionais (o recesso forense não esconde dias da agenda)
+function agEhDiaUtilAgenda(d){ const w = d.getDay(); if (w === 0 || w === 6) return false; return !agFeriados(d.getFullYear()).has(agISOd(d)); }
+// Dias da página a partir de "inicio": os 15 úteis + os não úteis no meio e logo depois,
+// até o próximo útil, para que nenhum dia fique fora de todas as páginas
+function agPaginaDias(inicio){
+  const out = []; let d = new Date(inicio); d.setHours(0,0,0,0); let uteis = 0, guarda = 0;
+  while (uteis < AG_DIAS_PAGINA && guarda++ < 120) {
+    const u = agEhDiaUtilAgenda(d); out.push({ date: new Date(d), util: u }); if (u) uteis++;
+    d = agAddDays(d, 1);
+  }
+  while (!agEhDiaUtilAgenda(d) && guarda++ < 140) { out.push({ date: new Date(d), util: false }); d = agAddDays(d, 1); }
+  return out;
+}
+function agPrevWk(){
+  let d = agAddDays(agendaWeekStart, -1), uteis = 0, guarda = 0;
+  while (guarda++ < 120) { if (agEhDiaUtilAgenda(d) && ++uteis === AG_DIAS_PAGINA) break; d = agAddDays(d, -1); }
+  agendaWeekStart = d; renderAgenda();
+}
+function agNextWk(){
+  const pag = agPaginaDias(agendaWeekStart);
+  agendaWeekStart = agAddDays(pag[pag.length - 1].date, 1); renderAgenda();
+}
 function agToday(){ agendaWeekStart = agMonday(new Date()); renderAgenda(); }
 
 // Mostra os campos extras conforme o tipo: Audiência (subcategorias) / Prazo (assunto)
@@ -6968,12 +7201,17 @@ async function rejeitarAgenda(id){
   .ag-left{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
   .ag-nav{display:flex;gap:4px}
   .ag-weeklabel{font-size:13px;font-weight:600;color:var(--gray-600)}
+  .ag-right{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+  .ag-card.ag-presc{background:#FFF8F8}
   .ag-viewname{font-size:15px;font-weight:700}
   .ag-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:16px}
   .ag-stat{background:#fff;border:1px solid var(--gray-100);border-radius:var(--r);padding:12px 16px;box-shadow:var(--sh)}
   .ag-stat .n{font-size:23px;font-weight:800;letter-spacing:-1px;line-height:1}
   .ag-stat .l{font-size:11px;color:var(--gray-400);margin-top:4px}
   .ag-week{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px}
+  .ag-wklbl{font-size:11px;font-weight:700;color:var(--gray-400);text-transform:uppercase;letter-spacing:.6px;margin:4px 0 8px}
+  .ag-wkrow{display:grid;grid-template-columns:repeat(var(--n,5),minmax(0,1fr));gap:10px;margin-bottom:18px}
+  .ag-day.naoutil .ag-day-hd{background:var(--gray-600)}
   .ag-day{background:#fff;border:1px solid var(--gray-100);border-radius:var(--r);box-shadow:var(--sh);display:flex;flex-direction:column;overflow:hidden}
   .ag-day-hd{padding:11px 13px;background:var(--gray-900);color:#fff;display:flex;justify-content:space-between;align-items:center;font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.5px}
   .ag-day-hd small{font-weight:500;color:rgba(255,255,255,.6);text-transform:none}
@@ -6996,7 +7234,7 @@ async function rejeitarAgenda(id){
   .ag-rej:hover{background:var(--purple-bg)}
   .ag-add{margin:8px;border:1.5px dashed var(--gray-200);background:var(--gray-50);color:var(--gray-400);border-radius:var(--r-sm);padding:7px;font-size:12px;font-weight:700;text-align:center;cursor:pointer}
   .ag-add:hover{border-color:var(--red);color:var(--red)}
-  @media(max-width:760px){.ag-stats{grid-template-columns:repeat(2,1fr)}.ag-week{grid-template-columns:1fr}}
+  @media(max-width:760px){.ag-stats{grid-template-columns:repeat(2,1fr)}.ag-week{grid-template-columns:1fr}.ag-wkrow{grid-template-columns:1fr}}
   `;
   const s = document.createElement('style'); s.textContent = css; document.head.appendChild(s);
 })();
@@ -7018,6 +7256,7 @@ async function rejeitarAgenda(id){
         await store.reload(['clientes']);
         if ($('page-clientes')?.classList.contains('active')) renderClients();
         if ($('page-dashboard')?.classList.contains('active')) renderDashboard();
+        if ($('page-agenda')?.classList.contains('active')) renderAgenda();
         updateBadges();
       })
       .subscribe();
@@ -7038,8 +7277,9 @@ async function _autoRefresh(){
     const active = document.querySelector('.page.active'); if (!active) return;
     const id = active.id;
     if (id === 'page-agenda') {
-      await store.reload(['agenda','assessores']);
-      const s = _pollSigCalc(store.agenda); if (s !== _pollSig.agenda){ _pollSig.agenda = s; renderAgenda(); }
+      await store.reload(['agenda','assessores','clientes']);
+      const s = _pollSigCalc(store.agenda) + '#' + store.clientes.map(c => c.id + c.status + (c.data_prescricao||'') + (c.adv_id||'')).join(';');
+      if (s !== _pollSig.agenda){ _pollSig.agenda = s; renderAgenda(); }
     } else if (id === 'page-assessores') {
       await store.reload(['assessores','agenda']);
       const s = _pollSigCalc(store.assessores) + _pollSigCalc(store.agenda); if (s !== _pollSig.ass){ _pollSig.ass = s; renderAssessores(); }
@@ -7059,9 +7299,10 @@ setInterval(_autoRefresh, 10000);
 
 // ══════════════════════════════════════════════════════════════════
 // ░░ NOTIFICAÇÕES NO COMPUTADOR (Windows / Mac, via navegador) ░░
-// Avisa: novo prazo/audiência na agenda do usuário, prazo rejeitado
-// enviado aos assessores, nova pré-entrevista, prazos que vencem hoje
-// e amanhã, prazos atrasados e compromisso com hora marcada (1h antes).
+// Avisa: novo prazo/audiência, prazo rejeitado enviado aos assessores,
+// nova pré-entrevista, prazos que vencem hoje e amanhã, atrasados e
+// compromisso com hora marcada (1h antes). Cada usuário escolhe, no sino,
+// o que quer receber, de quais agendas e, se quiser, só de certos processos.
 // Funciona enquanto o sistema estiver aberto em alguma aba (pode estar
 // minimizada ou em segundo plano).
 // ══════════════════════════════════════════════════════════════════
@@ -7070,9 +7311,83 @@ let _notifTimerNovos = null, _notifTimerLemb = null;
 let _notifDesde = null;            // ISO da última checagem de novidades
 let _notifBaselineFeita = false;   // 1ª checagem só registra, não notifica
 
+const NOTIF_EVENTOS = [
+  { k:'novo',      lbl:'📌 Novo prazo lançado' },
+  { k:'audnova',   lbl:'🏛️ Nova audiência marcada' },
+  { k:'rejeitado', lbl:'⤳ Prazo rejeitado por advogado' },
+  { k:'hoje',      lbl:'⏰ Vence hoje' },
+  { k:'amanha',    lbl:'📅 Vence amanhã' },
+  { k:'atrasados', lbl:'⚠️ Resumo de atrasados' },
+  { k:'umahora',   lbl:'🔔 1 hora antes (com hora marcada)' },
+  { k:'pre',       lbl:'📝 Pré-entrevista respondida', soPara:['admin','assessor','secretaria'] },
+  { k:'prescricao', lbl:'⚖️ Avisar prescrição de clientes ainda não protocolados', soPara:['admin','assessor','secretaria'], grupo:'presc' },
+];
+const NOTIF_PRESC_PAPEIS = ['admin','assessor','secretaria'];
+const NOTIF_PRESC_DIAS = [90, 60, 30, 15, 7, 3, 1];
+const NOTIF_TIPOS = [
+  { k:'juridico',  lbl:'⚖️ Prazo / processo' },
+  { k:'audiencia', lbl:'🏛️ Audiência' },
+  { k:'cliente',   lbl:'👤 Atendimento' },
+  { k:'reuniao',   lbl:'👥 Reunião' },
+  { k:'admin',     lbl:'🗂️ Administrativo' },
+];
+
 function notifAtivas(){
   return NOTIF_SUPORTE && Notification.permission === 'granted' && localStorage.getItem('mz_notif_off') !== '1';
 }
+
+// ── Preferências (por usuário, guardadas neste computador) ──
+function _notifPrefsKey(){ return currentUser ? `mz_notif_prefs:${currentUser.tipo}:${currentUser.id}` : 'mz_notif_prefs'; }
+
+// Agendas que o usuário enxerga e pode escolher para ser avisado
+function _notifAgendasDisponiveis(){
+  const u = currentUser; if (!u) return [];
+  const advs = store.advogados.map(a => ({ key:'adv:' + a.id, lbl:'⚖️ ' + a.nome }));
+  const asss = store.assessores.map(a => ({ key:'ass:' + a.id, lbl:'👥 ' + a.nome }));
+  const semResp = { key:'ass:none', lbl:'👥 Assessores sem responsável' };
+  switch (u.tipo) {
+    case 'admin':
+    case 'estagiario_chefe':
+    case 'estagiario':
+    case 'secretaria':       return advs.concat(asss, [semResp]);
+    case 'assessor':         return asss.concat([semResp]);
+    case 'advogado':         return [{ key:'adv:' + u.advId, lbl:'⚖️ Minha agenda' }];
+  }
+  return [];
+}
+// Padrão = o comportamento que já existia antes da escolha
+function _notifAgendasPadrao(){
+  const u = currentUser; const todas = _notifAgendasDisponiveis().map(a => a.key);
+  if (u.tipo === 'estagiario') return u.advId ? ['adv:' + u.advId] : [];
+  if (u.tipo === 'assessor')   return ['ass:' + u.id, 'ass:none'];
+  return todas;
+}
+function _notifPrefs(){
+  const base = {
+    eventos: Object.fromEntries(NOTIF_EVENTOS.map(e => [e.k, true])),
+    tipos:   Object.fromEntries(NOTIF_TIPOS.map(t => [t.k, true])),
+    agendas: null, modoProc: 'todos', processos: [],
+    prescAdvs: null, prescDias: [30, 15, 7, 3, 1], prescModo: 'todos', prescProc: []
+  };
+  let p = {};
+  try { p = JSON.parse(localStorage.getItem(_notifPrefsKey()) || '{}'); } catch(e){}
+  const r = { ...base, ...p, eventos:{ ...base.eventos, ...(p.eventos||{}) }, tipos:{ ...base.tipos, ...(p.tipos||{}) } };
+  if (!Array.isArray(r.agendas)) r.agendas = currentUser ? _notifAgendasPadrao() : [];
+  if (!Array.isArray(r.processos)) r.processos = [];
+  if (!Array.isArray(r.prescAdvs)) r.prescAdvs = _notifPrescAdvsDisponiveis().map(a => a.key);
+  if (!Array.isArray(r.prescDias)) r.prescDias = base.prescDias;
+  if (!Array.isArray(r.prescProc)) r.prescProc = [];
+  return r;
+}
+
+// Advogados disponíveis para os avisos de prescrição (+ clientes sem advogado)
+function _notifPrescAdvsDisponiveis(){
+  const s = currentUser ? advsVisiveisDe(currentUser) : null;   // assessor limitado pelo admin
+  return store.advogados.map(a => ({ key:'adv:' + a.id, id:a.id, lbl:'⚖️ ' + a.nome }))
+    .concat([{ key:'adv:none', id:'none', lbl:'⚖️ Sem advogado atribuído' }])
+    .filter(a => !s || s.has(a.id));
+}
+function _notifSalvarPrefs(p){ try { localStorage.setItem(_notifPrefsKey(), JSON.stringify(p)); } catch(e){} }
 
 // Registro do que já foi avisado (não repete), guardado neste navegador
 function _notifVistos(){ try { return JSON.parse(localStorage.getItem('mz_notif_vistos') || '{}'); } catch(e){ return {}; } }
@@ -7119,18 +7434,113 @@ async function _notifAbrirPrazo(id){
   } catch(e){}
 }
 
-// Qual prazo da agenda interessa a quem está logado
-function _notifPrazoRelevante(t){
+// ── Filtros: permissão de ver + agendas + tipo + processos escolhidos ──
+function _notifPodeVer(t){
   const u = currentUser; if (!u || !t) return false;
   switch (u.tipo) {
     case 'admin':            return true;
     case 'advogado':         return t.escopo === 'advogado' && t.adv_id === u.advId;
-    case 'assessor':         return (t.escopo === 'assessores' || t.escopo === 'trabalhos') && (!t.assessor_id || t.assessor_id === u.id);
-    case 'estagiario':       return t.escopo === 'advogado' && !!u.advId && t.adv_id === u.advId;
+    case 'assessor':         return t.escopo === 'assessores' || t.escopo === 'trabalhos';
+    case 'estagiario':       return t.escopo === 'advogado' || t.escopo === 'assessores';
     case 'estagiario_chefe': return t.escopo === 'assessores' || t.escopo === 'advogado';
     case 'secretaria':       return t.tipo === 'audiencia' || t.tipo === 'cliente';
   }
   return false;
+}
+function _notifChaveAgenda(t){
+  if (t.escopo === 'advogado') return 'adv:' + t.adv_id;
+  return t.assessor_id ? 'ass:' + t.assessor_id : 'ass:none';
+}
+function _notifNorm(s){ return String(s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, ''); }
+function _notifCasaProcesso(t, p){
+  if (p.modoProc !== 'lista') return true;
+  if (!p.processos.length) return false;
+  const txt = [t.titulo, t.descricao, t.assunto].join(' ');
+  const dig = txt.replace(/\D/g, ''), low = _notifNorm(txt);
+  return p.processos.some(x =>
+    (x.cnj && x.cnj.length >= 7 && dig.includes(x.cnj)) ||
+    (x.nome && x.nome.length >= 4 && low.includes(_notifNorm(x.nome))));
+}
+function _notifPrazoRelevante(t, p){
+  p = p || _notifPrefs();
+  if (!_notifPodeVer(t)) return false;
+  if (!p.agendas.includes(_notifChaveAgenda(t))) return false;
+  if (p.tipos[t.tipo || 'juridico'] === false) return false;
+  return _notifCasaProcesso(t, p);
+}
+
+// ── 3. Prescrição (admin, secretária, assessor) ──
+function _notifCasaCliente(c, lista){
+  const nomeC = _notifNorm(c.nome), procC = String(c.num_processo || '').replace(/\D/g, '');
+  return lista.some(x =>
+    (x.clienteId && x.clienteId === c.id) ||
+    (x.cnj && x.cnj.length >= 7 && procC && procC.includes(x.cnj)) ||
+    (x.nome && x.nome.length >= 4 && nomeC.includes(_notifNorm(x.nome))));
+}
+let _notifPrescUltima = 0;
+async function checarPrescricaoNotif(forcar){
+  const u = currentUser;
+  if (!u || !sb || !notifAtivas() || !NOTIF_PRESC_PAPEIS.includes(u.tipo)) return;
+  if (!forcar && Date.now() - _notifPrescUltima < 15*60000) return;   // a cada 15 min
+  _notifPrescUltima = Date.now();
+  const p = _notifPrefs();
+  if (!p.eventos.prescricao || !p.prescDias.length) return;
+  if (p.prescModo === 'lista' && !p.prescProc.length) return;
+  const hoje0 = new Date(); hoje0.setHours(0, 0, 0, 0);
+  const hoje = agISOd(hoje0);
+  const limite = new Date(hoje0); limite.setDate(limite.getDate() + Math.max(...p.prescDias));
+  try {
+    const { data } = await sb.from('clientes')
+      .select('id, nome, reclamada, num_processo, adv_id, data_prescricao, status, token_origem_id')
+      .in('status', ['ativo', 'pendente', 'desistencia'])
+      .not('data_prescricao', 'is', null).neq('data_prescricao', '')
+      .lte('data_prescricao', agISOd(limite));
+    let lista = data || [];
+    // Secretária sem permissão de ver todos: só clientes dos links que ela gerou
+    if (u.tipo === 'secretaria' && !u.perms?.canViewAllClients) {
+      const { data: toks } = await sb.from('tokens').select('id').eq('criador_id', u.id);
+      const meus = new Set((toks || []).map(t => t.id));
+      lista = lista.filter(c => meus.has(c.token_origem_id));
+    }
+    const sVis = advsVisiveisDe(u);
+    if (sVis) lista = lista.filter(c => sVis.has(c.adv_id || 'none'));
+    lista = lista.filter(c => p.prescAdvs.includes('adv:' + (c.adv_id || 'none')));
+    if (p.prescModo === 'lista') lista = lista.filter(c => _notifCasaCliente(c, p.prescProc));
+
+    const dias = c => Math.round((new Date(c.data_prescricao + 'T00:00:00') - hoje0) / 86400000);
+    const marcos = p.prescDias.slice().sort((a, b) => a - b);
+    const novosAvisos = [], chaves = [];
+    lista.forEach(c => {
+      const d = dias(c); if (d < 0) return;
+      const marco = d === 0 ? 0 : marcos.find(m => d <= m);
+      if (marco === undefined) return;
+      const chave = `presc:${c.id}:${c.data_prescricao}:${marco}`;
+      if (_notifJaVisto(chave)) return;
+      novosAvisos.push({ c, d }); chaves.push(chave);
+    });
+    const advN = id => (store.getAdv(id) || {}).nome || 'sem advogado';
+    const txtDias = d => d === 0 ? 'HOJE' : d === 1 ? 'amanhã' : `em ${d} dias`;
+    novosAvisos.sort((a, b) => a.d - b.d);
+    if (novosAvisos.length > 3) {
+      enviarNotif(`⚖️ ${novosAvisos.length} prescrições se aproximando`,
+        novosAvisos.slice(0, 4).map(x => `• ${x.c.nome} (${advN(x.c.adv_id)}): ${txtDias(x.d)}`).join('\n') + (novosAvisos.length > 4 ? '\n…' : ''),
+        { tag: 'mz-presc', urgente: novosAvisos[0].d <= 3, onclick: async () => { await store.reload(['clientes']); showPage('clientes'); } });
+    } else {
+      novosAvisos.forEach(({ c, d }) => enviarNotif(`⚖️ Prescrição ${txtDias(d)} — ${fmtDate(c.data_prescricao)}`,
+        `${c.nome}${c.reclamada ? ' x ' + c.reclamada : ''}\nAdvogado: ${advN(c.adv_id)}${c.num_processo ? '\nProc. ' + c.num_processo : '\nAinda sem protocolo'}`,
+        { tag: 'mz-presc-' + c.id, urgente: d <= 3, onclick: async () => { await store.reload(['clientes']); await showPage('clientes'); openDetail(c.id); } }));
+    }
+    _notifMarcar(chaves);
+
+    // Prescrição já vencida sem protocolo: um resumo por dia
+    const vencidos = lista.filter(c => dias(c) < 0);
+    if (vencidos.length && !_notifJaVisto('prescvenc:' + hoje)) {
+      enviarNotif(`❌ ${vencidos.length} cliente(s) com prescrição vencida e sem protocolo`,
+        vencidos.slice(0, 4).map(c => `• ${c.nome} (${fmtDate(c.data_prescricao)})`).join('\n') + (vencidos.length > 4 ? '\n…' : ''),
+        { tag: 'mz-prescvenc', onclick: async () => { await store.reload(['clientes']); showPage('clientes'); } });
+      _notifMarcar('prescvenc:' + hoje);
+    }
+  } catch(e) { console.warn('[Notificação] prescrição', e); }
 }
 
 function _notifDescPrazo(t){
@@ -7143,6 +7553,7 @@ function _notifDescPrazo(t){
 async function checarNovidadesNotif(){
   if (!currentUser || !sb) return;
   const agora = new Date().toISOString();
+  const p = _notifPrefs();
   // margem de 3 min contra diferença de relógio; o registro de "vistos" evita repetir
   const desde = new Date(Date.parse(_notifDesde || agora) - 180000).toISOString();
   try {
@@ -7150,13 +7561,15 @@ async function checarNovidadesNotif(){
       sb.from('agenda').select('*').gt('criado_em', desde),
       sb.from('agenda').select('*').gt('rejeitado_em', desde)
     ]);
-    const novos = (rNovos.data || []).filter(t => t.criado_por_id !== currentUser.id && _notifPrazoRelevante(t) && !_notifJaVisto('novo:' + t.id));
-    const rejs  = (rRej.data  || []).filter(t => t.rejeitado && t.rejeitado_por !== currentUser.nome && _notifPrazoRelevante(t) && !_notifJaVisto('rej:' + t.id));
+    const novos = (rNovos.data || []).filter(t => t.criado_por_id !== currentUser.id && !_notifJaVisto('novo:' + t.id));
+    const rejs  = (rRej.data  || []).filter(t => t.rejeitado && t.rejeitado_por !== currentUser.nome && !_notifJaVisto('rej:' + t.id));
 
     let pendentes = [];
     if (['admin','assessor','secretaria'].includes(currentUser.tipo)) {
-      const rCli = await sb.from('clientes').select('id, nome, reclamada, token_origem_id, criado_em').eq('status', 'pendente').gt('criado_em', desde);
+      const rCli = await sb.from('clientes').select('id, nome, reclamada, token_origem_id, adv_id, criado_em').eq('status', 'pendente').gt('criado_em', desde);
       pendentes = (rCli.data || []).filter(c => !_notifJaVisto('pre:' + c.id));
+      const sVis = advsVisiveisDe(currentUser);
+      if (sVis) pendentes = pendentes.filter(c => sVis.has(c.adv_id || 'none'));
       if (currentUser.tipo === 'secretaria' && pendentes.length) {
         const ids = pendentes.map(c => c.token_origem_id).filter(Boolean);
         const rTok = ids.length ? await sb.from('tokens').select('id, criador_id').in('id', ids) : { data: [] };
@@ -7166,26 +7579,31 @@ async function checarNovidadesNotif(){
     }
 
     if (_notifBaselineFeita && notifAtivas()) {
-      // Prazos e audiências novos
-      if (novos.length > 3) {
-        enviarNotif(`📌 ${novos.length} novos prazos na agenda`, novos.slice(0, 4).map(t => '• ' + t.titulo).join('\n') + (novos.length > 4 ? '\n…' : ''),
+      // Prazos e audiências novos, já filtrados pelas preferências
+      const aviso = novos.filter(t => _notifPrazoRelevante(t, p) && (t.tipo === 'audiencia' ? p.eventos.audnova : p.eventos.novo));
+      if (aviso.length > 3) {
+        enviarNotif(`📌 ${aviso.length} novos prazos na agenda`, aviso.slice(0, 4).map(t => '• ' + t.titulo).join('\n') + (aviso.length > 4 ? '\n…' : ''),
           { tag: 'mz-novos', onclick: () => _notifAbrirPrazo(null) });
       } else {
-        novos.forEach(t => {
+        aviso.forEach(t => {
           const aud = t.tipo === 'audiencia';
           enviarNotif(`${aud ? '🏛️ Nova audiência' : '📌 Novo prazo'}${t.criado_por_nome ? ' — lançado por ' + t.criado_por_nome : ''}`,
             _notifDescPrazo(t), { tag: 'mz-novo-' + t.id, onclick: () => _notifAbrirPrazo(t.id) });
         });
       }
       // Prazos rejeitados por advogado e enviados aos assessores
-      rejs.forEach(t => enviarNotif(`⤳ Prazo rejeitado por ${t.rejeitado_por || 'advogado'}`,
-        _notifDescPrazo(t) + '\nAgora está com os assessores.', { tag: 'mz-rej-' + t.id, onclick: () => _notifAbrirPrazo(t.id) }));
+      if (p.eventos.rejeitado) {
+        rejs.filter(t => _notifPrazoRelevante(t, p)).forEach(t => enviarNotif(`⤳ Prazo rejeitado por ${t.rejeitado_por || 'advogado'}`,
+          _notifDescPrazo(t) + '\nAgora está com os assessores.', { tag: 'mz-rej-' + t.id, onclick: () => _notifAbrirPrazo(t.id) }));
+      }
       // Pré-entrevistas respondidas
-      if (pendentes.length > 2) {
-        enviarNotif(`📝 ${pendentes.length} novas pré-entrevistas`, 'Aguardando aprovação.', { tag: 'mz-pre', onclick: () => showPage('dashboard') });
-      } else {
-        pendentes.forEach(c => enviarNotif('📝 Nova pré-entrevista respondida', `${c.nome}${c.reclamada ? ' x ' + c.reclamada : ''}\nAguardando aprovação.`,
-          { tag: 'mz-pre-' + c.id, onclick: async () => { await store.reload(['clientes']); await showPage('dashboard'); openDetail(c.id); } }));
+      if (p.eventos.pre) {
+        if (pendentes.length > 2) {
+          enviarNotif(`📝 ${pendentes.length} novas pré-entrevistas`, 'Aguardando aprovação.', { tag: 'mz-pre', onclick: () => showPage('dashboard') });
+        } else {
+          pendentes.forEach(c => enviarNotif('📝 Nova pré-entrevista respondida', `${c.nome}${c.reclamada ? ' x ' + c.reclamada : ''}\nAguardando aprovação.`,
+            { tag: 'mz-pre-' + c.id, onclick: async () => { await store.reload(['clientes']); await showPage('dashboard'); openDetail(c.id); } }));
+        }
       }
     }
     _notifMarcar([...novos.map(t => 'novo:' + t.id), ...rejs.map(t => 'rej:' + t.id), ...pendentes.map(c => 'pre:' + c.id)]);
@@ -7197,6 +7615,9 @@ async function checarNovidadesNotif(){
 // ── 2. Lembretes: vence hoje, vence amanhã, atrasados, 1h antes ──
 async function checarLembretesNotif(){
   if (!currentUser || !sb || !notifAtivas()) return;
+  const p = _notifPrefs();
+  const ev = p.eventos;
+  if (!ev.hoje && !ev.amanha && !ev.atrasados && !ev.umahora) return;
   const agoraD = new Date();
   const hoje = agISOd(agoraD);
   const amanhaD = new Date(agoraD); amanhaD.setDate(amanhaD.getDate() + 1);
@@ -7204,33 +7625,37 @@ async function checarLembretesNotif(){
   try {
     const [rProx, rAtr] = await Promise.all([
       sb.from('agenda').select('*').in('data', [hoje, amanha]).neq('status', 'concluida'),
-      sb.from('agenda').select('id, titulo, data, escopo, adv_id, assessor_id, tipo').lt('data', hoje).neq('status', 'concluida')
+      ev.atrasados ? sb.from('agenda').select('*').lt('data', hoje).neq('status', 'concluida') : Promise.resolve({ data: [] })
     ]);
-    const prox = (rProx.data || []).filter(_notifPrazoRelevante);
-    const atrasados = (rAtr.data || []).filter(_notifPrazoRelevante);
+    const prox = (rProx.data || []).filter(t => _notifPrazoRelevante(t, p));
+    const atrasados = (rAtr.data || []).filter(t => _notifPrazoRelevante(t, p));
 
     // Vence hoje (um aviso por dia)
-    const deHoje = prox.filter(t => t.data === hoje && !_notifJaVisto(`hoje:${t.id}:${hoje}`));
-    if (deHoje.length > 3) {
-      enviarNotif(`⏰ ${deHoje.length} prazos vencem HOJE`, deHoje.slice(0, 4).map(t => '• ' + t.titulo + (t.hora ? ' (' + t.hora + ')' : '')).join('\n') + (deHoje.length > 4 ? '\n…' : ''),
-        { tag: 'mz-hoje', urgente: true, onclick: () => _notifAbrirPrazo(null) });
-    } else {
-      deHoje.forEach(t => enviarNotif(`⏰ Vence HOJE${t.tipo === 'audiencia' ? ' — audiência' : ''}`, _notifDescPrazo(t),
-        { tag: 'mz-hoje-' + t.id, urgente: t.prioridade === 'alta' || t.tipo === 'audiencia', onclick: () => _notifAbrirPrazo(t.id) }));
+    if (ev.hoje) {
+      const deHoje = prox.filter(t => t.data === hoje && !_notifJaVisto(`hoje:${t.id}:${hoje}`));
+      if (deHoje.length > 3) {
+        enviarNotif(`⏰ ${deHoje.length} prazos vencem HOJE`, deHoje.slice(0, 4).map(t => '• ' + t.titulo + (t.hora ? ' (' + t.hora + ')' : '')).join('\n') + (deHoje.length > 4 ? '\n…' : ''),
+          { tag: 'mz-hoje', urgente: true, onclick: () => _notifAbrirPrazo(null) });
+      } else {
+        deHoje.forEach(t => enviarNotif(`⏰ Vence HOJE${t.tipo === 'audiencia' ? ' — audiência' : ''}`, _notifDescPrazo(t),
+          { tag: 'mz-hoje-' + t.id, urgente: t.prioridade === 'alta' || t.tipo === 'audiencia', onclick: () => _notifAbrirPrazo(t.id) }));
+      }
+      _notifMarcar(deHoje.map(t => `hoje:${t.id}:${hoje}`));
     }
-    _notifMarcar(deHoje.map(t => `hoje:${t.id}:${hoje}`));
 
     // Vence amanhã (um aviso agrupado por dia)
-    const deAmanha = prox.filter(t => t.data === amanha && !_notifJaVisto(`amanha:${t.id}:${hoje}`));
-    if (deAmanha.length) {
-      enviarNotif(deAmanha.length === 1 ? '📅 Vence amanhã' : `📅 ${deAmanha.length} prazos vencem amanhã`,
-        deAmanha.length === 1 ? _notifDescPrazo(deAmanha[0]) : deAmanha.slice(0, 4).map(t => '• ' + t.titulo).join('\n') + (deAmanha.length > 4 ? '\n…' : ''),
-        { tag: 'mz-amanha', onclick: () => _notifAbrirPrazo(deAmanha.length === 1 ? deAmanha[0].id : null) });
-      _notifMarcar(deAmanha.map(t => `amanha:${t.id}:${hoje}`));
+    if (ev.amanha) {
+      const deAmanha = prox.filter(t => t.data === amanha && !_notifJaVisto(`amanha:${t.id}:${hoje}`));
+      if (deAmanha.length) {
+        enviarNotif(deAmanha.length === 1 ? '📅 Vence amanhã' : `📅 ${deAmanha.length} prazos vencem amanhã`,
+          deAmanha.length === 1 ? _notifDescPrazo(deAmanha[0]) : deAmanha.slice(0, 4).map(t => '• ' + t.titulo).join('\n') + (deAmanha.length > 4 ? '\n…' : ''),
+          { tag: 'mz-amanha', onclick: () => _notifAbrirPrazo(deAmanha.length === 1 ? deAmanha[0].id : null) });
+        _notifMarcar(deAmanha.map(t => `amanha:${t.id}:${hoje}`));
+      }
     }
 
     // Atrasados (um resumo por dia)
-    if (atrasados.length && !_notifJaVisto('atrasados:' + hoje)) {
+    if (ev.atrasados && atrasados.length && !_notifJaVisto('atrasados:' + hoje)) {
       enviarNotif(`⚠️ ${atrasados.length} prazo(s) atrasado(s) em aberto`,
         atrasados.slice(0, 4).map(t => '• ' + t.titulo + ' (' + fmtDate(t.data) + ')').join('\n') + (atrasados.length > 4 ? '\n…' : ''),
         { tag: 'mz-atrasados', onclick: () => _notifAbrirPrazo(null) });
@@ -7238,30 +7663,32 @@ async function checarLembretesNotif(){
     }
 
     // Compromisso com hora marcada: aviso 1 hora antes
-    prox.filter(t => t.data === hoje && t.hora).forEach(t => {
-      const [h, m] = t.hora.split(':').map(Number);
-      const quando = new Date(agoraD); quando.setHours(h || 0, m || 0, 0, 0);
-      const faltam = Math.round((quando - agoraD) / 60000);
-      const chave = `1h:${t.id}:${hoje}`;
-      if (faltam > 0 && faltam <= 60 && !_notifJaVisto(chave)) {
-        const oque = t.tipo === 'audiencia' ? 'Audiência' : t.tipo === 'cliente' ? 'Atendimento' : t.tipo === 'reuniao' ? 'Reunião' : 'Prazo';
-        enviarNotif(`🔔 ${oque} em ${faltam} min (${t.hora})`, _notifDescPrazo(t) + (t.aud_modalidade ? '\n' + t.aud_modalidade : ''),
-          { tag: 'mz-1h-' + t.id, urgente: true, onclick: () => _notifAbrirPrazo(t.id) });
-        _notifMarcar(chave);
-      }
-    });
+    if (ev.umahora) {
+      prox.filter(t => t.data === hoje && t.hora).forEach(t => {
+        const [h, m] = t.hora.split(':').map(Number);
+        const quando = new Date(agoraD); quando.setHours(h || 0, m || 0, 0, 0);
+        const faltam = Math.round((quando - agoraD) / 60000);
+        const chave = `1h:${t.id}:${hoje}`;
+        if (faltam > 0 && faltam <= 60 && !_notifJaVisto(chave)) {
+          const oque = t.tipo === 'audiencia' ? 'Audiência' : t.tipo === 'cliente' ? 'Atendimento' : t.tipo === 'reuniao' ? 'Reunião' : 'Prazo';
+          enviarNotif(`🔔 ${oque} em ${faltam} min (${t.hora})`, _notifDescPrazo(t) + (t.aud_modalidade ? '\n' + t.aud_modalidade : ''),
+            { tag: 'mz-1h-' + t.id, urgente: true, onclick: () => _notifAbrirPrazo(t.id) });
+          _notifMarcar(chave);
+        }
+      });
+    }
   } catch(e) { console.warn('[Notificação] lembretes', e); }
 }
 
-// ── Sino na barra lateral + liga/desliga ──
+// ── Sino na barra lateral ──
 function atualizarSinoNotif(){
   const btn = $('btn-notif'), dot = $('notif-dot'); if (!btn || !dot) return;
   let cor = '', titulo = '';
   if (!NOTIF_SUPORTE) { titulo = 'Este navegador não mostra notificações'; }
   else if (Notification.permission === 'denied') { titulo = 'Notificações bloqueadas no navegador (clique para ver como liberar)'; cor = '#C8102E'; }
   else if (Notification.permission === 'default') { titulo = 'Clique para ativar as notificações no computador'; cor = '#E07B00'; }
-  else if (localStorage.getItem('mz_notif_off') === '1') { titulo = 'Notificações desligadas (clique para ligar)'; cor = '#9898A3'; }
-  else { titulo = 'Notificações ligadas (clique para desligar)'; cor = '#1A8C4E'; }
+  else if (localStorage.getItem('mz_notif_off') === '1') { titulo = 'Notificações desligadas (clique para configurar)'; cor = '#9898A3'; }
+  else { titulo = 'Notificações ligadas (clique para escolher o que receber)'; cor = '#1A8C4E'; }
   btn.title = titulo;
   dot.style.background = cor; dot.style.display = cor ? '' : 'none';
 }
@@ -7274,28 +7701,199 @@ async function toggleNotificacoes(){
     return;
   }
   if (Notification.permission === 'default') {
-    const p = await Notification.requestPermission();
+    const perm = await Notification.requestPermission();
     _notifFecharBanner();
     atualizarSinoNotif();
-    if (p === 'granted') {
-      localStorage.removeItem('mz_notif_off');
-      enviarNotif('🔔 Notificações ativadas', 'Você será avisado de novos prazos, audiências e prazos vencendo, mesmo com o sistema minimizado.', { tag: 'mz-teste' });
-      iniciarNotificacoes();
-    } else {
-      toast('Notificações não autorizadas.');
-    }
-    return;
-  }
-  if (localStorage.getItem('mz_notif_off') === '1') {
+    if (perm !== 'granted') { toast('Notificações não autorizadas.'); return; }
     localStorage.removeItem('mz_notif_off');
-    atualizarSinoNotif();
-    enviarNotif('🔔 Notificações ligadas', 'Este é um aviso de teste.', { tag: 'mz-teste' });
+    enviarNotif('🔔 Notificações ativadas', 'Escolha no sino o que quer receber e de quais agendas.', { tag: 'mz-teste' });
     iniciarNotificacoes();
-  } else {
-    localStorage.setItem('mz_notif_off', '1');
-    atualizarSinoNotif();
-    toast('🔕 Notificações desligadas neste computador');
   }
+  abrirConfigNotif();
+}
+
+// ── Painel de preferências ──
+// Listas de escolha do painel: 'proc' = filtro da agenda, 'presc' = filtro de prescrição
+let _notifCfgListas = { proc: [], presc: [] };
+let _notifSugMap = {};   // texto da sugestão → id do cliente
+function abrirConfigNotif(){
+  if (!currentUser) return;
+  const p = _notifPrefs();
+  _notifCfgListas = { proc: p.processos.slice(), presc: p.prescProc.slice() };
+  const ligadas = localStorage.getItem('mz_notif_off') !== '1';
+  const agendas = _notifAgendasDisponiveis();
+  const varias = agendas.length > 1;
+  const comPresc = NOTIF_PRESC_PAPEIS.includes(currentUser.tipo);
+  const eventos = NOTIF_EVENTOS.filter(e => !e.grupo && (!e.soPara || e.soPara.includes(currentUser.tipo)));
+  const tipos = currentUser.tipo === 'secretaria' ? NOTIF_TIPOS.filter(t => t.k === 'audiencia' || t.k === 'cliente') : NOTIF_TIPOS;
+  const pill = (id, lbl, on) => `<label class="check-pill"><input type="checkbox" id="${id}" ${on ? 'checked' : ''}><div class="dot"></div>${escHtml(lbl)}</label>`;
+  const secao = t => `<div class="form-divider" style="margin:18px 0 10px"><span>${t}</span></div>`;
+  const sub = t => `<div style="font-size:11px;font-weight:700;color:var(--gray-600);text-transform:uppercase;letter-spacing:.5px;margin:14px 0 8px">${t}</div>`;
+  const inputEstilo = 'flex:1;padding:10px 13px;border:1.5px solid var(--gray-100);border-radius:var(--r-sm);font-family:inherit;font-size:13px;background:var(--gray-50);outline:none';
+
+  // Sugestões: clientes que a pessoa enxerga
+  const visiveis = currentUser.tipo === 'admin' ? store.clientes : store.forUser(currentUser);
+  const advIds = new Set(agendas.filter(a => a.key.startsWith('adv:')).map(a => a.key.slice(4)));
+  _notifSugMap = {};
+  const sugOpt = lista => lista.filter(c => c.status !== 'rejeitado').map(c => {
+    const v = `${c.nome} — ${c.num_processo || c.reclamada || 'sem processo'}`;
+    _notifSugMap[v] = c.id;
+    return `<option value="${escHtml(v)}">`;
+  }).join('');
+  const sugAgenda = sugOpt(store.clientes.filter(c => currentUser.tipo === 'admin' || currentUser.tipo === 'assessor' || advIds.has(c.adv_id)));
+  const sugPresc = comPresc ? sugOpt(visiveis.filter(c => !['protocolado','prescrito'].includes(c.status))) : '';
+
+  const blocoLista = (k, modo, rotTodos, sug, ajuda) => `
+      <div style="display:flex;flex-direction:column;gap:6px;font-size:13px">
+        <label style="display:flex;gap:8px;align-items:center;cursor:pointer"><input type="radio" name="ncfg-modo-${k}" value="todos" ${modo !== 'lista' ? 'checked' : ''} onchange="_notifModoProc('${k}')" style="width:auto"> ${rotTodos}</label>
+        <label style="display:flex;gap:8px;align-items:center;cursor:pointer"><input type="radio" name="ncfg-modo-${k}" value="lista" ${modo === 'lista' ? 'checked' : ''} onchange="_notifModoProc('${k}')" style="width:auto"> Somente os que eu escolher</label>
+      </div>
+      <div id="ncfg-box-${k}" style="margin-top:10px;${modo === 'lista' ? '' : 'display:none'}">
+        <div style="display:flex;gap:8px">
+          <input type="text" id="ncfg-in-${k}" list="ncfg-dl-${k}" placeholder="Nome do cliente ou nº do processo" style="${inputEstilo}" onkeydown="if(event.key==='Enter'){event.preventDefault();_notifAddProc('${k}');}">
+          <datalist id="ncfg-dl-${k}">${sug}</datalist>
+          <button class="btn btn-red btn-sm" onclick="_notifAddProc('${k}')">Adicionar</button>
+        </div>
+        <div id="ncfg-chips-${k}" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:10px"></div>
+        <p style="font-size:11px;color:var(--gray-400);margin-top:8px;line-height:1.5">${ajuda}</p>
+      </div>`;
+
+  const advsPresc = _notifPrescAdvsDisponiveis();
+  const blocoPresc = comPresc ? `
+      ${secao('Prescrição')}
+      <div class="checkbox-group">${pill('ncfg-ev-prescricao', '⚖️ Avisar prescrição de clientes ainda não protocolados', p.eventos.prescricao)}</div>
+      ${sub('Avisar quando faltarem')}
+      <div class="checkbox-group">${NOTIF_PRESC_DIAS.map(d => pill('ncfg-pd-' + d, d === 1 ? '1 dia' : d + ' dias', p.prescDias.includes(d))).join('')}</div>
+      <p style="font-size:11px;color:var(--gray-400);margin-top:6px">No dia da prescrição sempre há aviso. Prescrição já vencida sem protocolo entra num resumo diário.</p>
+      ${sub('De quais advogados')}
+      <div style="display:flex;gap:8px;margin-bottom:10px">
+        <button class="btn btn-ghost btn-sm" onclick="_notifMarcarGrupo('ncfg-padvs',true)">Marcar todos</button>
+        <button class="btn btn-ghost btn-sm" onclick="_notifMarcarGrupo('ncfg-padvs',false)">Desmarcar todos</button>
+      </div>
+      <div class="checkbox-group" id="ncfg-padvs">${advsPresc.map(a => pill('ncfg-pa-' + a.key.replace(':', '_'), a.lbl, p.prescAdvs.includes(a.key))).join('')}</div>
+      ${sub('De quais clientes ou processos')}
+      ${blocoLista('presc', p.prescModo, 'Todos os clientes dos advogados marcados', sugPresc,
+        'Escolha da lista para vincular o cliente exato, mesmo antes do protocolo. Também dá para digitar o nome ou o número do processo.')}` : '';
+
+  let m = $('modal-notif-cfg');
+  if (m) m.remove();
+  m = document.createElement('div');
+  m.className = 'overlay'; m.id = 'modal-notif-cfg';
+  m.innerHTML = `<div class="modal" style="max-width:660px">
+    <div class="modal-hd"><div><h2>🔔 Notificações no computador</h2><p>Escolha o que avisar, de quais agendas, advogados e processos. Vale para este computador.</p></div>
+      <button class="btn-icon-sq" onclick="closeModal('modal-notif-cfg')"><svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+    </div>
+    <div class="modal-body">
+      <div class="perm-row">
+        <div class="perm-row-info"><h5>Notificações ligadas</h5><p>Desligue para não receber nada neste computador, sem perder as escolhas abaixo.</p></div>
+        <button class="toggle ${ligadas ? 'on' : ''}" id="ncfg-ligadas" onclick="this.classList.toggle('on')"></button>
+      </div>
+
+      ${secao('Agenda: o que avisar')}
+      <div class="checkbox-group">${eventos.map(e => pill('ncfg-ev-' + e.k, e.lbl, p.eventos[e.k])).join('')}</div>
+
+      ${sub('Tipos de compromisso')}
+      <div class="checkbox-group">${tipos.map(t => pill('ncfg-tp-' + t.k, t.lbl, p.tipos[t.k])).join('')}</div>
+
+      ${varias ? `${sub('De quais agendas')}
+      <div style="display:flex;gap:8px;margin-bottom:10px">
+        <button class="btn btn-ghost btn-sm" onclick="_notifMarcarGrupo('ncfg-agendas',true)">Marcar todas</button>
+        <button class="btn btn-ghost btn-sm" onclick="_notifMarcarGrupo('ncfg-agendas',false)">Desmarcar todas</button>
+      </div>
+      <div class="checkbox-group" id="ncfg-agendas">${agendas.map(a => pill('ncfg-ag-' + a.key.replace(':', '_'), a.lbl, p.agendas.includes(a.key))).join('')}</div>` : ''}
+
+      ${sub('De quais processos')}
+      ${blocoLista('proc', p.modoProc, 'Todos os processos' + (varias ? ' das agendas marcadas' : ''), sugAgenda,
+        'O aviso sai quando o número do processo ou o nome do cliente aparece no título, no assunto ou nas anotações do prazo. Prazo lançado sem número nem nome não é reconhecido por este filtro.')}
+
+      ${blocoPresc}
+    </div>
+    <div class="modal-ft">
+      <button class="btn btn-ghost" onclick="_notifTeste()" style="margin-right:auto">Enviar teste</button>
+      <button class="btn btn-ghost" onclick="closeModal('modal-notif-cfg')">Cancelar</button>
+      <button class="btn btn-red" onclick="salvarConfigNotif()">Salvar</button>
+    </div>
+  </div>`;
+  m.addEventListener('click', e => { if (e.target === m) m.classList.remove('open'); });
+  document.body.appendChild(m);
+  _notifRenderChips('proc');
+  if (comPresc) _notifRenderChips('presc');
+  openModal('modal-notif-cfg');
+}
+
+function _notifMarcarGrupo(id, on){ document.querySelectorAll('#' + id + ' input[type=checkbox]').forEach(i => i.checked = on); }
+function _notifModoLido(k){ return document.querySelector(`input[name="ncfg-modo-${k}"]:checked`)?.value === 'lista' ? 'lista' : 'todos'; }
+function _notifModoProc(k){
+  const box = $('ncfg-box-' + k); if (box) box.style.display = _notifModoLido(k) === 'lista' ? '' : 'none';
+}
+function _notifAddProc(k){
+  const inp = $('ncfg-in-' + k); if (!inp) return;
+  const v = inp.value.trim(); if (!v) return;
+  const lista = _notifCfgListas[k];
+  if (lista.some(x => x.label === v)) { inp.value = ''; return; }
+  const clienteId = _notifSugMap[v];
+  let item;
+  if (clienteId) {
+    const c = store.getCliente(clienteId) || {};
+    item = { label: v, clienteId, nome: c.nome || v.split(' — ')[0], cnj: String(c.num_processo || '').replace(/\D/g, '') };
+  } else {
+    const mCnj = v.match(/\d{7}-?\d{2}\.?\d{4}\.?\d\.?\d{2}\.?\d{4}/);
+    const digitos = v.replace(/\D/g, '');
+    const cnj = mCnj ? mCnj[0].replace(/\D/g, '') : (digitos.length >= 7 ? digitos : '');
+    let nome = v.split(' — ')[0].trim();
+    if (/^[\d\s.\-\/]+$/.test(nome)) nome = '';
+    if (!cnj && nome.length < 4) { toast('⚠️ Digite o nº do processo ou um nome com ao menos 4 letras'); return; }
+    item = { label: v, cnj, nome };
+  }
+  lista.push(item);
+  inp.value = '';
+  _notifRenderChips(k);
+}
+function _notifRemProc(k, i){ _notifCfgListas[k].splice(i, 1); _notifRenderChips(k); }
+function _notifRenderChips(k){
+  const box = $('ncfg-chips-' + k); if (!box) return;
+  const lista = _notifCfgListas[k];
+  box.innerHTML = lista.length
+    ? lista.map((x, i) => `<span class="badge b-info" style="font-size:12px;padding:5px 6px 5px 11px">${escHtml(x.label)}<button onclick="_notifRemProc('${k}',${i})" title="Remover" style="border:none;background:none;cursor:pointer;color:inherit;font-weight:800;padding:0 4px">×</button></span>`).join('')
+    : '<span style="font-size:12px;color:var(--gray-400)">Nenhum escolhido ainda.</span>';
+}
+function _notifTeste(){
+  if (!NOTIF_SUPORTE || Notification.permission !== 'granted') { toast('⚠️ Ative as notificações no navegador primeiro'); return; }
+  try {
+    const n = new Notification('🔔 Teste de notificação', { body: 'É assim que os avisos do MZ Clientes vão aparecer.', icon: _notifIcone() || undefined, tag: 'mz-teste' });
+    n.onclick = () => { window.focus(); n.close(); };
+  } catch(e) { toast('❌ ' + e.message); }
+}
+function salvarConfigNotif(){
+  const p = _notifPrefs();
+  NOTIF_EVENTOS.forEach(e => { const el = $('ncfg-ev-' + e.k); if (el) p.eventos[e.k] = el.checked; });
+  NOTIF_TIPOS.forEach(t => { const el = $('ncfg-tp-' + t.k); if (el) p.tipos[t.k] = el.checked; });
+  const agendas = _notifAgendasDisponiveis();
+  if (agendas.length > 1) p.agendas = agendas.filter(a => $('ncfg-ag-' + a.key.replace(':', '_'))?.checked).map(a => a.key);
+  else p.agendas = agendas.map(a => a.key);
+  p.modoProc = _notifModoLido('proc');
+  p.processos = _notifCfgListas.proc.slice();
+  if (p.modoProc === 'lista' && !p.processos.length) { toast('⚠️ Agenda: adicione ao menos um processo, ou marque "Todos os processos"'); return; }
+
+  const comPresc = NOTIF_PRESC_PAPEIS.includes(currentUser.tipo);
+  if (comPresc) {
+    p.prescDias = NOTIF_PRESC_DIAS.filter(d => $('ncfg-pd-' + d)?.checked);
+    p.prescAdvs = _notifPrescAdvsDisponiveis().filter(a => $('ncfg-pa-' + a.key.replace(':', '_'))?.checked).map(a => a.key);
+    p.prescModo = _notifModoLido('presc');
+    p.prescProc = _notifCfgListas.presc.slice();
+    if (p.eventos.prescricao && p.prescModo === 'lista' && !p.prescProc.length) { toast('⚠️ Prescrição: adicione ao menos um cliente, ou marque "Todos os clientes"'); return; }
+  }
+  _notifSalvarPrefs(p);
+  if ($('ncfg-ligadas')?.classList.contains('on')) localStorage.removeItem('mz_notif_off');
+  else localStorage.setItem('mz_notif_off', '1');
+  atualizarSinoNotif();
+  closeModal('modal-notif-cfg');
+  const alertas = [];
+  if (!p.agendas.length && agendas.length > 1) alertas.push('nenhuma agenda marcada');
+  if (comPresc && p.eventos.prescricao && !p.prescAdvs.length) alertas.push('nenhum advogado marcado na prescrição');
+  if (comPresc && p.eventos.prescricao && !p.prescDias.length) alertas.push('nenhuma antecedência marcada na prescrição');
+  toast(alertas.length ? '⚠️ Salvo, mas: ' + alertas.join('; ') + '.' : '✅ Preferências de notificação salvas');
+  if (comPresc) checarPrescricaoNotif(true);
 }
 
 // Faixa discreta convidando a ativar (só enquanto o navegador ainda não perguntou)
@@ -7325,8 +7923,9 @@ function iniciarNotificacoes(){
   _notifBaselineFeita = false;
   checarNovidadesNotif();                       // 1ª rodada só registra o que já existe
   setTimeout(checarLembretesNotif, 4000);       // lembretes logo após entrar
+  setTimeout(() => checarPrescricaoNotif(true), 7000);
   _notifTimerNovos = setInterval(checarNovidadesNotif, 20000);
-  _notifTimerLemb  = setInterval(checarLembretesNotif, 60000);
+  _notifTimerLemb  = setInterval(() => { checarLembretesNotif(); checarPrescricaoNotif(); }, 60000);
 }
 
 function pararNotificacoes(manterBanner){
@@ -7334,7 +7933,7 @@ function pararNotificacoes(manterBanner){
   if (_notifTimerLemb) clearInterval(_notifTimerLemb);
   _notifTimerNovos = _notifTimerLemb = null;
   _notifDesde = null; _notifBaselineFeita = false;
-  if (!manterBanner) _notifFecharBanner();
+  if (!manterBanner) { _notifFecharBanner(); const m = $('modal-notif-cfg'); if (m) m.remove(); }
 }
 
 // Se a permissão mudar pelo cadeado do navegador, atualiza o sino
