@@ -2220,14 +2220,29 @@ const store = {
     return q;
   },
   // O Supabase entrega no máximo 1.000 linhas por consulta: busca em páginas até trazer tudo
+  // Cada consulta tem tempo-limite: uma tabela travada não pode prender a abertura do sistema
+  async _comLimite(promessa, ms, t) {
+    let timer;
+    const limite = new Promise(res => { timer = setTimeout(() => res({ data: null, error: { message: 'tempo esgotado (' + Math.round(ms/1000) + 's) em ' + t } }), ms); });
+    try { return await Promise.race([promessa, limite]); } finally { clearTimeout(timer); }
+  },
+  _falhasCarga: [],
   async _buscarTudo(t) {
-    if (t === 'audit_log') { const { data } = await this._consulta(t); return data || []; }
-    const PAG = 1000; let todos = [];
+    if (t === 'audit_log') {
+      const { data, error } = await this._comLimite(this._consulta(t), 20000, t);
+      if (error) this._falhasCarga.push(t + ': ' + error.message);
+      return data || [];
+    }
+    const PAG = 1000; const todos = []; const vistos = new Set();
     for (let de = 0; de < 100000; de += PAG) {
-      const { data, error } = await this._consulta(t).range(de, de + PAG - 1);
-      if (error) { console.warn('[carga]', t, error.message); break; }
-      todos = todos.concat(data || []);
-      if (!data || data.length < PAG) break;
+      const { data, error } = await this._comLimite(this._consulta(t).range(de, de + PAG - 1), 30000, t);
+      if (error) { console.warn('[carga]', t, error.message); if (!/does not exist|42P01/i.test(error.message || '')) this._falhasCarga.push(t + ': ' + error.message); break; }
+      const pag = data || [];
+      let novos = 0;
+      pag.forEach(r => { const k = r && r.id; if (k == null || !vistos.has(k)) { if (k != null) vistos.add(k); todos.push(r); novos++; } });
+      if (t === 'clientes' && typeof _progressoCarga === 'function') _progressoCarga(todos.length);
+      // Página incompleta = fim. Página só com linhas repetidas = o servidor ignorou a paginação: para aqui.
+      if (pag.length < PAG || novos === 0) break;
     }
     return todos;
   },
@@ -2387,6 +2402,10 @@ const openModal  = id => { const m = $(id); if (m){ _resetBtns(m); m.classList.a
 const closeModal = id => { const m = $(id); if (m){ _resetBtns(m); m.classList.remove('open'); } };
 document.querySelectorAll('.overlay').forEach(o => o.addEventListener('click', e => { if (e.target === o) o.classList.remove('open'); }));
 
+function _progressoCarga(n){ const el = $('loading-msg'); if (el && $('loading-overlay').classList.contains('show')) el.textContent = 'Carregando clientes… ' + n.toLocaleString('pt-BR'); }
+// Se qualquer erro inesperado acontecer com a tela de carregamento aberta, ela é fechada e o motivo aparece
+window.addEventListener('error', e => { const o = $('loading-overlay'); if (o && o.classList.contains('show')) { o.classList.remove('show'); toast('❌ Erro ao abrir: ' + (e.message || 'desconhecido')); } });
+window.addEventListener('unhandledrejection', e => { const o = $('loading-overlay'); if (o && o.classList.contains('show')) { o.classList.remove('show'); toast('❌ Erro ao abrir: ' + ((e.reason && e.reason.message) || e.reason || 'desconhecido')); } });
 function loading(show, msg = 'Salvando…') {
   const el = $('loading-overlay');
   el.classList.toggle('show', show);
@@ -2842,14 +2861,27 @@ function abrirRedefinirSenha() {
 }
 
 async function bootApp() {
-  if (window._appBooted) return;   // evita boot duplicado
+  // evita boot duplicado, mas não deixa um boot anterior que falhou travar o login
+  if (window._appBooted && $('app').style.display === 'block') return;
+  if (window._bootEmCurso) return;
+  window._bootEmCurso = true;
+  setTimeout(() => { window._bootEmCurso = false; }, 90000);
   window._appBooted = true;
   // Salva a sessão para não cair no login a cada recarga
   try { if (currentUser) localStorage.setItem('mz_sessao', JSON.stringify(currentUser)); } catch(e) {}
 
   loading(true, 'Carregando dados…');
-  await store.load();
+  store._falhasCarga = [];
+  try {
+    await store.load();
+  } catch(e) {
+    console.error('[abertura]', e);
+    store._falhasCarga.push('erro geral: ' + (e && e.message || e));
+  }
   loading(false);
+  if (store._falhasCarga.length) {
+    setTimeout(() => toast('⚠️ Parte dos dados não carregou: ' + store._falhasCarga.slice(0, 2).join(' | ') + '. Recarregue a página (F5).'), 800);
+  }
   // Atualiza permissões da sessão salva (o admin pode ter mudado desde o último acesso)
   try {
     if (currentUser.tipo === 'advogado') {
@@ -2907,6 +2939,7 @@ async function bootApp() {
 
   // Notificações no computador (prazos, audiências, pré-entrevistas)
   iniciarNotificacoes();
+  window._bootEmCurso = false;
 }
 
 // ═══════════════════════════════════════════════════════════════════
