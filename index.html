@@ -6961,11 +6961,33 @@ function renderAgenda(){
 function agTypeIcon(t){ return t==='prescricao'?'⏳':t==='audiencia'?'🏛️':t==='cliente'?'👤':t==='reuniao'?'👥':t==='admin'?'🗂️':'⚖️'; }
 
 // ── Cor e nome curto do dono de cada prazo ──
-const AG_CORES_ADV = ['#C8102E','#1A5EC8','#0F8A5F','#C96A00','#0E7490','#9D174D','#4D7C0F','#6D28D9'];
+// Cada pessoa (advogado ou assessor) tem uma cor só dela, sem repetir entre cargos.
+// A ordem segue a data de cadastro, então quem entra depois recebe uma cor nova
+// e as cores de quem já existe não mudam. Cinza fica reservado para "sem responsável".
+const AG_CORES_BASE = ['#C8102E','#1A5EC8','#0F8A5F','#D97706','#7C3AED','#0E7490','#DB2777','#65A30D','#92400E','#4338CA','#A21CAF','#CA8A04'];
+let _agCoresCache = { sig: '', mapa: {} };
+function agCorPessoa(chave){
+  const pessoas = store.advogados.map(a => ({ k: 'adv:' + a.id, t: a.created_at || '' }))
+    .concat(store.assessores.map(a => ({ k: 'ass:' + a.id, t: a.created_at || '' })))
+    .sort((x, y) => String(x.t).localeCompare(String(y.t)) || x.k.localeCompare(y.k));
+  const sig = pessoas.map(p => p.k).join('|');
+  if (sig !== _agCoresCache.sig) {
+    const mapa = {};
+    pessoas.forEach((p, i) => {
+      mapa[p.k] = i < AG_CORES_BASE.length
+        ? AG_CORES_BASE[i]
+        // além da paleta: tons gerados pelo ângulo áureo, todos diferentes entre si
+        : `hsl(${Math.round((i * 137.508 + 23) % 360)}, ${62 - (i % 3) * 6}%, ${34 + (i % 4) * 5}%)`;
+    });
+    _agCoresCache = { sig, mapa };
+  }
+  return _agCoresCache.mapa[chave] || '#9898A3';
+}
 function agDonoChave(t){ return t.escopo === 'advogado' ? 'adv:' + t.adv_id : (t.assessor_id ? 'ass:' + t.assessor_id : (t._presc ? 'adv:none' : 'ass:none')); }
 function agDonoCor(t){
-  if (t.escopo === 'advogado' && t.adv_id) { const i = store.advogados.findIndex(a => a.id === t.adv_id); return AG_CORES_ADV[(i < 0 ? 0 : i) % AG_CORES_ADV.length]; }
-  return t.assessor_id ? '#7C3AED' : '#9898A3';
+  if (t.escopo === 'advogado' && t.adv_id) return agCorPessoa('adv:' + t.adv_id);
+  if (t.assessor_id) return agCorPessoa('ass:' + t.assessor_id);
+  return '#9898A3';
 }
 function agNomeCurto(n){ const p = String(n || '').trim().split(/\s+/); return p.length > 1 ? p[0] + ' ' + p[p.length - 1] : (p[0] || ''); }
 function agDonoCurto(t){
