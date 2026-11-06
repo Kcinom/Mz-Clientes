@@ -745,6 +745,10 @@ body:has(#pre-screen[style*="flex"]) #app { display: none !important; }
       <div class="sb-user">
         <div class="sb-avatar" id="sb-ava">?</div>
         <div class="sb-user-info"><h4 id="sb-name">—</h4><span id="sb-role">—</span></div>
+        <button class="sb-logout" id="btn-notif" onclick="toggleNotificacoes()" title="Notificações no computador" style="margin-right:2px;position:relative">
+          <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
+          <span id="notif-dot" style="display:none;position:absolute;top:2px;right:2px;width:7px;height:7px;border-radius:50%"></span>
+        </button>
         <button class="sb-logout" id="btn-alterar-cred" onclick="openAlterarCredenciais()" title="Alterar minhas credenciais" style="display:none;margin-right:4px">
           <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>
         </button>
@@ -2815,6 +2819,9 @@ async function bootApp() {
 
   // Ativa marca d'água + bloqueios anti-print/screenshot
   ativarProtecaoAntiPrint();
+
+  // Notificações no computador (prazos, audiências, pré-entrevistas)
+  iniciarNotificacoes();
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -2861,6 +2868,7 @@ function toggleSidebar() {
 })();
 
 function doLogout() {
+  pararNotificacoes();
   currentUser = null;
   window._appBooted = false;
   try { localStorage.removeItem('mz_sessao'); } catch(e) {}   // limpa sessão salva
@@ -7048,6 +7056,289 @@ async function _autoRefresh(){
   } catch(e) { /* silencioso */ }
 }
 setInterval(_autoRefresh, 10000);
+
+// ══════════════════════════════════════════════════════════════════
+// ░░ NOTIFICAÇÕES NO COMPUTADOR (Windows / Mac, via navegador) ░░
+// Avisa: novo prazo/audiência na agenda do usuário, prazo rejeitado
+// enviado aos assessores, nova pré-entrevista, prazos que vencem hoje
+// e amanhã, prazos atrasados e compromisso com hora marcada (1h antes).
+// Funciona enquanto o sistema estiver aberto em alguma aba (pode estar
+// minimizada ou em segundo plano).
+// ══════════════════════════════════════════════════════════════════
+const NOTIF_SUPORTE = ('Notification' in window);
+let _notifTimerNovos = null, _notifTimerLemb = null;
+let _notifDesde = null;            // ISO da última checagem de novidades
+let _notifBaselineFeita = false;   // 1ª checagem só registra, não notifica
+
+function notifAtivas(){
+  return NOTIF_SUPORTE && Notification.permission === 'granted' && localStorage.getItem('mz_notif_off') !== '1';
+}
+
+// Registro do que já foi avisado (não repete), guardado neste navegador
+function _notifVistos(){ try { return JSON.parse(localStorage.getItem('mz_notif_vistos') || '{}'); } catch(e){ return {}; } }
+function _notifJaVisto(chave){ return !!_notifVistos()[chave]; }
+function _notifMarcar(chaves){
+  const v = _notifVistos(), agora = Date.now(), limite = agora - 4*86400000;
+  Object.keys(v).forEach(k => { if (v[k] < limite) delete v[k]; });
+  (Array.isArray(chaves) ? chaves : [chaves]).forEach(k => { v[k] = agora; });
+  try { localStorage.setItem('mz_notif_vistos', JSON.stringify(v)); } catch(e){}
+}
+
+function _notifIcone(){
+  if (window._notifIco !== undefined) return window._notifIco;
+  try {
+    const c = document.createElement('canvas'); c.width = c.height = 128;
+    const x = c.getContext('2d');
+    x.fillStyle = '#C8102E'; x.beginPath(); x.arc(64, 64, 64, 0, 2*Math.PI); x.fill();
+    x.fillStyle = '#FFFFFF'; x.font = 'bold 54px Arial'; x.textAlign = 'center'; x.textBaseline = 'middle';
+    x.fillText('MZ', 64, 68);
+    window._notifIco = c.toDataURL('image/png');
+  } catch(e) { window._notifIco = ''; }
+  return window._notifIco;
+}
+
+function enviarNotif(titulo, corpo, opt = {}){
+  if (!notifAtivas()) return;
+  try {
+    const n = new Notification(titulo, {
+      body: corpo || '',
+      tag: opt.tag || undefined,
+      icon: _notifIcone() || undefined,
+      requireInteraction: !!opt.urgente   // urgente fica na tela até clicar
+    });
+    n.onclick = () => { try { window.focus(); } catch(e){} try { opt.onclick && opt.onclick(); } catch(e){} n.close(); };
+  } catch(e) { console.warn('[Notificação]', e); }
+}
+
+// Abre o prazo clicado na notificação
+async function _notifAbrirPrazo(id){
+  try {
+    await store.reload(['agenda']);
+    await showPage('agenda');
+    if (id) openEditAgenda(id);
+  } catch(e){}
+}
+
+// Qual prazo da agenda interessa a quem está logado
+function _notifPrazoRelevante(t){
+  const u = currentUser; if (!u || !t) return false;
+  switch (u.tipo) {
+    case 'admin':            return true;
+    case 'advogado':         return t.escopo === 'advogado' && t.adv_id === u.advId;
+    case 'assessor':         return (t.escopo === 'assessores' || t.escopo === 'trabalhos') && (!t.assessor_id || t.assessor_id === u.id);
+    case 'estagiario':       return t.escopo === 'advogado' && !!u.advId && t.adv_id === u.advId;
+    case 'estagiario_chefe': return t.escopo === 'assessores' || t.escopo === 'advogado';
+    case 'secretaria':       return t.tipo === 'audiencia' || t.tipo === 'cliente';
+  }
+  return false;
+}
+
+function _notifDescPrazo(t){
+  const quando = t.data ? (fmtDate(t.data) + (t.hora ? ' às ' + t.hora : '')) : 'sem data';
+  const dono = (typeof agOwnerLabel === 'function') ? agOwnerLabel(t).replace(/^[^ ]+ /, '') : '';
+  return `${t.titulo}\n📅 ${quando}${dono ? ' · ' + dono : ''}`;
+}
+
+// ── 1. Novidades: prazos novos, rejeitados e pré-entrevistas ──
+async function checarNovidadesNotif(){
+  if (!currentUser || !sb) return;
+  const agora = new Date().toISOString();
+  // margem de 3 min contra diferença de relógio; o registro de "vistos" evita repetir
+  const desde = new Date(Date.parse(_notifDesde || agora) - 180000).toISOString();
+  try {
+    const [rNovos, rRej] = await Promise.all([
+      sb.from('agenda').select('*').gt('criado_em', desde),
+      sb.from('agenda').select('*').gt('rejeitado_em', desde)
+    ]);
+    const novos = (rNovos.data || []).filter(t => t.criado_por_id !== currentUser.id && _notifPrazoRelevante(t) && !_notifJaVisto('novo:' + t.id));
+    const rejs  = (rRej.data  || []).filter(t => t.rejeitado && t.rejeitado_por !== currentUser.nome && _notifPrazoRelevante(t) && !_notifJaVisto('rej:' + t.id));
+
+    let pendentes = [];
+    if (['admin','assessor','secretaria'].includes(currentUser.tipo)) {
+      const rCli = await sb.from('clientes').select('id, nome, reclamada, token_origem_id, criado_em').eq('status', 'pendente').gt('criado_em', desde);
+      pendentes = (rCli.data || []).filter(c => !_notifJaVisto('pre:' + c.id));
+      if (currentUser.tipo === 'secretaria' && pendentes.length) {
+        const ids = pendentes.map(c => c.token_origem_id).filter(Boolean);
+        const rTok = ids.length ? await sb.from('tokens').select('id, criador_id').in('id', ids) : { data: [] };
+        const meus = new Set((rTok.data || []).filter(tk => tk.criador_id === currentUser.id).map(tk => tk.id));
+        pendentes = pendentes.filter(c => meus.has(c.token_origem_id));
+      }
+    }
+
+    if (_notifBaselineFeita && notifAtivas()) {
+      // Prazos e audiências novos
+      if (novos.length > 3) {
+        enviarNotif(`📌 ${novos.length} novos prazos na agenda`, novos.slice(0, 4).map(t => '• ' + t.titulo).join('\n') + (novos.length > 4 ? '\n…' : ''),
+          { tag: 'mz-novos', onclick: () => _notifAbrirPrazo(null) });
+      } else {
+        novos.forEach(t => {
+          const aud = t.tipo === 'audiencia';
+          enviarNotif(`${aud ? '🏛️ Nova audiência' : '📌 Novo prazo'}${t.criado_por_nome ? ' — lançado por ' + t.criado_por_nome : ''}`,
+            _notifDescPrazo(t), { tag: 'mz-novo-' + t.id, onclick: () => _notifAbrirPrazo(t.id) });
+        });
+      }
+      // Prazos rejeitados por advogado e enviados aos assessores
+      rejs.forEach(t => enviarNotif(`⤳ Prazo rejeitado por ${t.rejeitado_por || 'advogado'}`,
+        _notifDescPrazo(t) + '\nAgora está com os assessores.', { tag: 'mz-rej-' + t.id, onclick: () => _notifAbrirPrazo(t.id) }));
+      // Pré-entrevistas respondidas
+      if (pendentes.length > 2) {
+        enviarNotif(`📝 ${pendentes.length} novas pré-entrevistas`, 'Aguardando aprovação.', { tag: 'mz-pre', onclick: () => showPage('dashboard') });
+      } else {
+        pendentes.forEach(c => enviarNotif('📝 Nova pré-entrevista respondida', `${c.nome}${c.reclamada ? ' x ' + c.reclamada : ''}\nAguardando aprovação.`,
+          { tag: 'mz-pre-' + c.id, onclick: async () => { await store.reload(['clientes']); await showPage('dashboard'); openDetail(c.id); } }));
+      }
+    }
+    _notifMarcar([...novos.map(t => 'novo:' + t.id), ...rejs.map(t => 'rej:' + t.id), ...pendentes.map(c => 'pre:' + c.id)]);
+    _notifBaselineFeita = true;
+    _notifDesde = agora;
+  } catch(e) { console.warn('[Notificação] checagem', e); }
+}
+
+// ── 2. Lembretes: vence hoje, vence amanhã, atrasados, 1h antes ──
+async function checarLembretesNotif(){
+  if (!currentUser || !sb || !notifAtivas()) return;
+  const agoraD = new Date();
+  const hoje = agISOd(agoraD);
+  const amanhaD = new Date(agoraD); amanhaD.setDate(amanhaD.getDate() + 1);
+  const amanha = agISOd(amanhaD);
+  try {
+    const [rProx, rAtr] = await Promise.all([
+      sb.from('agenda').select('*').in('data', [hoje, amanha]).neq('status', 'concluida'),
+      sb.from('agenda').select('id, titulo, data, escopo, adv_id, assessor_id, tipo').lt('data', hoje).neq('status', 'concluida')
+    ]);
+    const prox = (rProx.data || []).filter(_notifPrazoRelevante);
+    const atrasados = (rAtr.data || []).filter(_notifPrazoRelevante);
+
+    // Vence hoje (um aviso por dia)
+    const deHoje = prox.filter(t => t.data === hoje && !_notifJaVisto(`hoje:${t.id}:${hoje}`));
+    if (deHoje.length > 3) {
+      enviarNotif(`⏰ ${deHoje.length} prazos vencem HOJE`, deHoje.slice(0, 4).map(t => '• ' + t.titulo + (t.hora ? ' (' + t.hora + ')' : '')).join('\n') + (deHoje.length > 4 ? '\n…' : ''),
+        { tag: 'mz-hoje', urgente: true, onclick: () => _notifAbrirPrazo(null) });
+    } else {
+      deHoje.forEach(t => enviarNotif(`⏰ Vence HOJE${t.tipo === 'audiencia' ? ' — audiência' : ''}`, _notifDescPrazo(t),
+        { tag: 'mz-hoje-' + t.id, urgente: t.prioridade === 'alta' || t.tipo === 'audiencia', onclick: () => _notifAbrirPrazo(t.id) }));
+    }
+    _notifMarcar(deHoje.map(t => `hoje:${t.id}:${hoje}`));
+
+    // Vence amanhã (um aviso agrupado por dia)
+    const deAmanha = prox.filter(t => t.data === amanha && !_notifJaVisto(`amanha:${t.id}:${hoje}`));
+    if (deAmanha.length) {
+      enviarNotif(deAmanha.length === 1 ? '📅 Vence amanhã' : `📅 ${deAmanha.length} prazos vencem amanhã`,
+        deAmanha.length === 1 ? _notifDescPrazo(deAmanha[0]) : deAmanha.slice(0, 4).map(t => '• ' + t.titulo).join('\n') + (deAmanha.length > 4 ? '\n…' : ''),
+        { tag: 'mz-amanha', onclick: () => _notifAbrirPrazo(deAmanha.length === 1 ? deAmanha[0].id : null) });
+      _notifMarcar(deAmanha.map(t => `amanha:${t.id}:${hoje}`));
+    }
+
+    // Atrasados (um resumo por dia)
+    if (atrasados.length && !_notifJaVisto('atrasados:' + hoje)) {
+      enviarNotif(`⚠️ ${atrasados.length} prazo(s) atrasado(s) em aberto`,
+        atrasados.slice(0, 4).map(t => '• ' + t.titulo + ' (' + fmtDate(t.data) + ')').join('\n') + (atrasados.length > 4 ? '\n…' : ''),
+        { tag: 'mz-atrasados', onclick: () => _notifAbrirPrazo(null) });
+      _notifMarcar('atrasados:' + hoje);
+    }
+
+    // Compromisso com hora marcada: aviso 1 hora antes
+    prox.filter(t => t.data === hoje && t.hora).forEach(t => {
+      const [h, m] = t.hora.split(':').map(Number);
+      const quando = new Date(agoraD); quando.setHours(h || 0, m || 0, 0, 0);
+      const faltam = Math.round((quando - agoraD) / 60000);
+      const chave = `1h:${t.id}:${hoje}`;
+      if (faltam > 0 && faltam <= 60 && !_notifJaVisto(chave)) {
+        const oque = t.tipo === 'audiencia' ? 'Audiência' : t.tipo === 'cliente' ? 'Atendimento' : t.tipo === 'reuniao' ? 'Reunião' : 'Prazo';
+        enviarNotif(`🔔 ${oque} em ${faltam} min (${t.hora})`, _notifDescPrazo(t) + (t.aud_modalidade ? '\n' + t.aud_modalidade : ''),
+          { tag: 'mz-1h-' + t.id, urgente: true, onclick: () => _notifAbrirPrazo(t.id) });
+        _notifMarcar(chave);
+      }
+    });
+  } catch(e) { console.warn('[Notificação] lembretes', e); }
+}
+
+// ── Sino na barra lateral + liga/desliga ──
+function atualizarSinoNotif(){
+  const btn = $('btn-notif'), dot = $('notif-dot'); if (!btn || !dot) return;
+  let cor = '', titulo = '';
+  if (!NOTIF_SUPORTE) { titulo = 'Este navegador não mostra notificações'; }
+  else if (Notification.permission === 'denied') { titulo = 'Notificações bloqueadas no navegador (clique para ver como liberar)'; cor = '#C8102E'; }
+  else if (Notification.permission === 'default') { titulo = 'Clique para ativar as notificações no computador'; cor = '#E07B00'; }
+  else if (localStorage.getItem('mz_notif_off') === '1') { titulo = 'Notificações desligadas (clique para ligar)'; cor = '#9898A3'; }
+  else { titulo = 'Notificações ligadas (clique para desligar)'; cor = '#1A8C4E'; }
+  btn.title = titulo;
+  dot.style.background = cor; dot.style.display = cor ? '' : 'none';
+}
+
+async function toggleNotificacoes(){
+  if (!NOTIF_SUPORTE) { toast('⚠️ Este navegador não mostra notificações. Use Chrome ou Edge.'); return; }
+  if (!window.isSecureContext) { toast('⚠️ Abra o sistema pelo endereço https (não pelo arquivo) para usar notificações.'); return; }
+  if (Notification.permission === 'denied') {
+    toast('🔕 Bloqueado no navegador: clique no cadeado ao lado do endereço → Notificações → Permitir, e recarregue a página.');
+    return;
+  }
+  if (Notification.permission === 'default') {
+    const p = await Notification.requestPermission();
+    _notifFecharBanner();
+    atualizarSinoNotif();
+    if (p === 'granted') {
+      localStorage.removeItem('mz_notif_off');
+      enviarNotif('🔔 Notificações ativadas', 'Você será avisado de novos prazos, audiências e prazos vencendo, mesmo com o sistema minimizado.', { tag: 'mz-teste' });
+      iniciarNotificacoes();
+    } else {
+      toast('Notificações não autorizadas.');
+    }
+    return;
+  }
+  if (localStorage.getItem('mz_notif_off') === '1') {
+    localStorage.removeItem('mz_notif_off');
+    atualizarSinoNotif();
+    enviarNotif('🔔 Notificações ligadas', 'Este é um aviso de teste.', { tag: 'mz-teste' });
+    iniciarNotificacoes();
+  } else {
+    localStorage.setItem('mz_notif_off', '1');
+    atualizarSinoNotif();
+    toast('🔕 Notificações desligadas neste computador');
+  }
+}
+
+// Faixa discreta convidando a ativar (só enquanto o navegador ainda não perguntou)
+function _notifMostrarBanner(){
+  if (!NOTIF_SUPORTE || Notification.permission !== 'default' || !window.isSecureContext) return;
+  if (localStorage.getItem('mz_notif_banner_off') === '1' || $('notif-banner')) return;
+  const b = document.createElement('div');
+  b.id = 'notif-banner';
+  b.style.cssText = 'position:fixed;left:24px;bottom:24px;z-index:9000;background:var(--gray-900);color:#fff;border-radius:12px;padding:14px 16px;box-shadow:var(--sh-lg);max-width:360px;font-size:13px;line-height:1.5;display:flex;gap:12px;align-items:flex-start';
+  b.innerHTML = `<div style="font-size:22px;line-height:1">🔔</div>
+    <div style="flex:1"><div style="font-weight:700;margin-bottom:2px">Receber avisos no computador?</div>
+    <div style="color:rgba(255,255,255,.7)">Novos prazos, audiências, prazos vencendo e pré-entrevistas.</div>
+    <div style="display:flex;gap:8px;margin-top:10px">
+      <button class="btn btn-red btn-sm" onclick="toggleNotificacoes()">Ativar</button>
+      <button class="btn btn-sm" style="background:rgba(255,255,255,.1);color:#fff" onclick="localStorage.setItem('mz_notif_banner_off','1');_notifFecharBanner()">Agora não</button>
+    </div></div>`;
+  document.body.appendChild(b);
+}
+function _notifFecharBanner(){ const b = $('notif-banner'); if (b) b.remove(); }
+
+function iniciarNotificacoes(){
+  pararNotificacoes(true);
+  atualizarSinoNotif();
+  _notifMostrarBanner();
+  if (!currentUser) return;
+  _notifDesde = new Date().toISOString();
+  _notifBaselineFeita = false;
+  checarNovidadesNotif();                       // 1ª rodada só registra o que já existe
+  setTimeout(checarLembretesNotif, 4000);       // lembretes logo após entrar
+  _notifTimerNovos = setInterval(checarNovidadesNotif, 20000);
+  _notifTimerLemb  = setInterval(checarLembretesNotif, 60000);
+}
+
+function pararNotificacoes(manterBanner){
+  if (_notifTimerNovos) clearInterval(_notifTimerNovos);
+  if (_notifTimerLemb) clearInterval(_notifTimerLemb);
+  _notifTimerNovos = _notifTimerLemb = null;
+  _notifDesde = null; _notifBaselineFeita = false;
+  if (!manterBanner) _notifFecharBanner();
+}
+
+// Se a permissão mudar pelo cadeado do navegador, atualiza o sino
+try { navigator.permissions && navigator.permissions.query({ name: 'notifications' }).then(st => { st.onchange = () => { atualizarSinoNotif(); if (currentUser) iniciarNotificacoes(); }; }); } catch(e){}
 </script>
 </body>
 </html>
