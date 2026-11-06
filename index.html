@@ -663,7 +663,7 @@ body:has(#pre-screen[style*="flex"]) #app { display: none !important; }
       </p>
 
       <p style="margin-top:16px;font-size:11px;color:var(--gray-400);text-align:center"><a href="#" onclick="showSetup()" style="color:var(--info)">Configurar banco de dados</a></p>
-      <p style="margin-top:6px;font-size:10px;color:var(--gray-200);text-align:center">versão 06/11/2026 17h25</p>
+      <p style="margin-top:6px;font-size:10px;color:var(--gray-200);text-align:center">versão 06/11/2026 17h45</p>
     </div>
   </div>
 </div>
@@ -737,7 +737,7 @@ body:has(#pre-screen[style*="flex"]) #app { display: none !important; }
           <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
           Feriados locais
         </div>
-        <div class="nav-item" onclick="showPage('auditoria')">
+        <div class="nav-item nav-loginmgmt" onclick="showPage('auditoria')">
           <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
           Auditoria
         </div>
@@ -2228,10 +2228,16 @@ const store = {
     try { return await Promise.race([promessa, limite]); } finally { clearTimeout(timer); }
   },
   _falhasCarga: [],
+  _erros: {},
   async _buscarTudo(t) {
+    const r = await this._buscarTudoInterno(t);
+    if (r._incompleto) this._erros[t] = r._erro || 'falha ao buscar'; else delete this._erros[t];
+    return r;
+  },
+  async _buscarTudoInterno(t) {
     if (t === 'audit_log') {
       const { data, error } = await this._comLimite(this._consulta(t), 30000, t);
-      if (error) { this._falhasCarga.push(t + ': ' + error.message); const v = []; v._incompleto = true; return v; }
+      if (error) { this._falhasCarga.push(t + ': ' + error.message); const v = []; v._incompleto = true; v._erro = error.message; return v; }
       return data || [];
     }
     const PAG = 500; const todos = []; const vistos = new Set();
@@ -2240,7 +2246,7 @@ const store = {
       if (error) {
         console.warn('[carga]', t, error.message);
         const tabelaInexistente = /does not exist|42P01|PGRST205|could not find the table/i.test((error.message || '') + ' ' + (error.code || ''));
-        if (!tabelaInexistente) { this._falhasCarga.push(t + ': ' + error.message); todos._incompleto = true; }
+        if (!tabelaInexistente) { this._falhasCarga.push(t + ': ' + error.message); todos._incompleto = true; todos._erro = (error.code ? error.code + ' · ' : '') + error.message; }
         break;
       }
       const pag = data || [];
@@ -2285,6 +2291,7 @@ const store = {
     if (!this._clientesCompletos) tarefasFundo.push(this._continuarClientes(PRIM));
     Promise.all(tarefasFundo).finally(() => {
       this._fundoCompleto = true;
+      _cacheSalvarEmBreve(2000);
       if (typeof updateBadges === 'function') updateBadges();
       if ($('page-preentrevistas')?.classList.contains('active')) renderPreEntrevistas();
       if (typeof agendarRender === 'function') agendarRender('fundo');
@@ -2327,6 +2334,7 @@ const store = {
       this._guardar(t, res[i]);
       if (t === 'clientes' || t === 'agenda') this._marcarSync(t);
     });
+    _cacheSalvarEmBreve();
   },
 
   // ── Atualização incremental: só busca o que mudou desde a última vez (coluna atualizado_em) ──
@@ -2372,6 +2380,7 @@ const store = {
     if (removidos.length) { const s = new Set(removidos); const n = lista.length; this[t] = lista.filter(r => !s.has(r.id)); mudou = mudou || n !== this[t].length; }
     const st = this._sync[t] || (this._sync[t] = {});
     (this[t] || []).forEach(r => { if (r.atualizado_em && (!st.ultimo || r.atualizado_em > st.ultimo)) st.ultimo = r.atualizado_em; });
+    if (mudou) _cacheSalvarEmBreve();
     return mudou;
   },
 
@@ -2430,7 +2439,7 @@ const can = {
   approveCliente:   u => u?.tipo === 'admin' || u?.tipo === 'assessor',
   protocolarCliente:u => u?.tipo === 'admin' || u?.tipo === 'assessor' || u?.tipo === 'advogado',
   manageUsers:      u => u?.tipo === 'admin' || u?.tipo === 'estagiario_chefe',
-  viewAudit:        u => u?.tipo === 'admin' || u?.tipo === 'assessor',
+  viewAudit:        u => u?.tipo === 'admin',   // auditoria: somente o administrador
   sendLinks:        u => u?.tipo === 'admin' || u?.tipo === 'assessor' || (u?.tipo === 'secretaria' && u?.perms?.canSendLinks !== false),
   viewPre:          u => u?.tipo === 'admin' || u?.tipo === 'assessor' || u?.tipo === 'secretaria',
   manageEstagiarios: u => u?.tipo === 'admin' || u?.tipo === 'estagiario_chefe',
@@ -2959,15 +2968,22 @@ async function bootApp() {
   // Salva a sessão para não cair no login a cada recarga
   try { if (currentUser) localStorage.setItem('mz_sessao', JSON.stringify(currentUser)); } catch(e) {}
 
-  loading(true, 'Carregando dados…');
   store._falhasCarga = [];
-  try {
-    await store.load();
-  } catch(e) {
-    console.error('[abertura]', e);
-    store._falhasCarga.push('erro geral: ' + (e && e.message || e));
+  // Entrada instantânea: se há cópia da última sessão neste navegador, abre com ela
+  // e atualiza com o banco em segundo plano logo depois.
+  const usouCopia = await _cacheHidratar();
+  if (!usouCopia) {
+    loading(true, 'Carregando dados…');
+    try {
+      await store.load();
+    } catch(e) {
+      console.error('[abertura]', e);
+      store._falhasCarga.push('erro geral: ' + (e && e.message || e));
+    }
+    loading(false);
+  } else {
+    setTimeout(_cacheAtualizarDoBanco, 300);
   }
-  loading(false);
   if (store._falhasCarga.length) {
     setTimeout(() => toast('⚠️ Parte dos dados não carregou: ' + store._falhasCarga.slice(0, 2).join(' | ') + '. Recarregue a página (F5).'), 800);
   }
@@ -2983,7 +2999,7 @@ async function bootApp() {
   try {
     if (currentUser.tipo === 'advogado') {
       // Cadastro de advogado juntado a um assessor: entra como a conta unificada
-      const ass = store.assessores.find(a => a.perms && a.perms.advVinculado === currentUser.advId);
+      const ass = currentUser.advId && store.assessores.find(a => a.perms && a.perms.advVinculado === currentUser.advId);
       if (ass) currentUser = { tipo:'assessor', nome: ass.nome, email: ass.email, id: ass.id, perms: ass.perms || {}, advId: currentUser.advId, oab: currentUser.oab || '' };
     }
     if (currentUser.tipo === 'assessor') {
@@ -3084,6 +3100,7 @@ function toggleSidebar() {
 
 function doLogout() {
   pararNotificacoes();
+  _cacheApagarTudo();   // a cópia local dos dados não fica no computador depois de sair
   currentUser = null;
   window._appBooted = false;
   try { localStorage.removeItem('mz_sessao'); } catch(e) {}   // limpa sessão salva
@@ -3353,7 +3370,13 @@ function updateBadges() {
 // NAVIGATION
 // ══════════════════════════════════════════════════════════════════
 const PAGE_TITLES = { dashboard: 'Dashboard', clientes: 'Clientes', preentrevistas: 'Pré-entrevistas', advogados: 'Advogados', secretarias: 'Secretárias', estagiarios: 'Estagiários', estagiarios_chefes: 'Estagiários Chefes', tarefas: 'Tarefas', auditoria: 'Auditoria', agenda: 'Agenda', assessores: 'Assessores', feriados: 'Feriados locais' };
+async function _tentarDeNovo(tabela, pagina){
+  const g = document.querySelector('.page.active .adv-grid, .page.active #audit-container, .page.active #clients-container'); if (g) g.innerHTML = '<div class="empty" style="grid-column:1/-1"><p>Carregando…</p></div>';
+  await store.reload([tabela]);
+  showPage(pagina);
+}
 async function showPage(name) {
+  if (name === 'auditoria' && !can.viewAudit(currentUser)) { toast('⛔ A auditoria é restrita ao administrador'); return; }
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
   document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
   $('page-' + name)?.classList.add('active');
@@ -3370,6 +3393,16 @@ async function showPage(name) {
   if (name === 'assessores' && can.manageAssessores(currentUser)) ta.innerHTML = `<button class="btn btn-red btn-sm" onclick="openNewAssessor()"><svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>Novo Assessor</button>`;
   if (name === 'feriados' && (currentUser.tipo === 'admin' || currentUser.tipo === 'assessor')) ta.innerHTML = `<button class="btn btn-red btn-sm" onclick="openNewFeriado()"><svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>Novo Feriado</button>`;
 
+  const TAB_DA_PAGINA = { advogados:'advogados', secretarias:'secretarias', estagiarios:'estagiarios', estagiarios_chefes:'estagiarios_chefes', assessores:'assessores', auditoria:'audit_log', clientes:'clientes' };
+  const GRID_DA_PAGINA = { advogados:'adv-grid', secretarias:'sec-grid', estagiarios:'est-grid', estagiarios_chefes:'estc-grid', assessores:'ass-grid', auditoria:'audit-container', clientes:'clients-container' };
+  const _dadosPag = TAB_DA_PAGINA[name] === 'audit_log' ? store.auditLog : store[TAB_DA_PAGINA[name]];
+  if (TAB_DA_PAGINA[name] && store._erros[TAB_DA_PAGINA[name]] && !(_dadosPag || []).length) {
+    const g = $(GRID_DA_PAGINA[name]);
+    if (g) g.innerHTML = `<div class="empty" style="grid-column:1/-1;color:var(--red)"><p><strong>Não foi possível carregar este cadastro.</strong></p>
+      <p style="font-size:12px;color:var(--gray-600);margin-top:6px">Motivo informado pelo banco: ${escHtml(store._erros[TAB_DA_PAGINA[name]])}</p>
+      <button class="btn btn-red btn-sm" style="margin-top:14px" onclick="_tentarDeNovo('${TAB_DA_PAGINA[name]}','${name}')">Tentar de novo</button></div>`;
+    return;
+  }
   if (name === 'dashboard')      await renderDashboard();
   if (name === 'clientes')       renderClients();
   if (name === 'preentrevistas') renderPreEntrevistas();
@@ -6816,6 +6849,74 @@ async function salvarAdvsVisiveis(){
 }
 
 // ══════════════════════════════════════════════════════════════════
+// ░░ CÓPIA LOCAL DOS DADOS (entrada instantânea) ░░
+// Ao fim de cada carga, os dados ficam guardados no IndexedDB deste navegador,
+// separados por usuário. Na próxima entrada o sistema abre com essa cópia na hora
+// e atualiza com o banco em segundo plano. "Sair" apaga a cópia.
+// ══════════════════════════════════════════════════════════════════
+const _CACHE_TABS = ['advogados','secretarias','estagiarios','estagiarios_chefes','assessores','agenda','feriados_locais','clientes','tokens','tarefas','audit_log'];
+const _CACHE_VALIDADE = 7 * 86400000;   // cópia com mais de 7 dias não é usada
+function _cacheChave(){ return currentUser ? 'u:' + currentUser.tipo + ':' + currentUser.id : null; }
+function _cacheAbrir(){
+  return new Promise((res, rej) => {
+    if (!('indexedDB' in window)) return rej(new Error('sem IndexedDB'));
+    const r = indexedDB.open('mz-cache', 1);
+    r.onupgradeneeded = () => r.result.createObjectStore('dados');
+    r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+  });
+}
+async function _cacheOp(modo, fn){
+  try {
+    const db = await _cacheAbrir();
+    return await new Promise(res => {
+      const tx = db.transaction('dados', modo), os = tx.objectStore('dados');
+      const req = fn(os);
+      tx.oncomplete = () => { res(req && 'result' in req ? req.result : true); db.close(); };
+      tx.onerror = tx.onabort = () => { res(null); db.close(); };
+    });
+  } catch(e) { return null; }
+}
+async function _cacheHidratar(){
+  const chave = _cacheChave(); if (!chave) return false;
+  const leitura = _cacheOp('readonly', os => os.get(chave));
+  const c = await Promise.race([leitura, new Promise(r => setTimeout(() => r(null), 1500))]);
+  if (!c || !c.tabelas || Date.now() - (c.ts || 0) > _CACHE_VALIDADE) return false;
+  _CACHE_TABS.forEach(t => { if (Array.isArray(c.tabelas[t])) store._guardar(t, c.tabelas[t]); });
+  if (!store.clientes.length) return false;            // cópia vazia não serve
+  store._clientesCompletos = true; store._fundoCompleto = true;
+  store._marcarSync('clientes'); store._marcarSync('agenda');
+  window._usandoCopia = true;
+  return true;
+}
+let _cacheTimer = null;
+function _cacheSalvarEmBreve(ms = 15000){
+  if (!currentUser || !store._clientesCompletos || !store._fundoCompleto) return;
+  clearTimeout(_cacheTimer);
+  _cacheTimer = setTimeout(_cacheSalvar, ms);
+}
+async function _cacheSalvar(){
+  const chave = _cacheChave(); if (!chave || !store.clientes.length) return;
+  const tabelas = {};
+  _CACHE_TABS.forEach(t => { tabelas[t] = t === 'audit_log' ? store.auditLog : store[t]; });
+  await _cacheOp('readwrite', os => os.put({ ts: Date.now(), tabelas }, chave));
+}
+function _cacheApagarTudo(){ clearTimeout(_cacheTimer); _cacheOp('readwrite', os => os.clear()); }
+// Depois de abrir com a cópia: busca tudo do banco em segundo plano e troca sem piscar a tela
+async function _cacheAtualizarDoBanco(){
+  _indicadorFundo(0);
+  const el = $('carga-fundo'); if (el) el.innerHTML = '<div class="btn-spinner"></div> Atualizando com o banco…';
+  try {
+    store._falhasCarga = [];
+    await store.reload(_CACHE_TABS);
+    if (store._falhasCarga.length) toast('⚠️ Não foi possível atualizar tudo com o banco agora; mostrando a última cópia. ' + store._falhasCarga[0]);
+    window._usandoCopia = false;
+    agendarRender('copia');
+    if (typeof updateBadges === 'function') updateBadges();
+    _cacheSalvarEmBreve(1000);
+  } finally { _indicadorFundo(null); }
+}
+
+// ══════════════════════════════════════════════════════════════════
 // ░░ VÍNCULO ASSESSOR + ADVOGADO (mesma pessoa, um login só) ░░
 // O admin junta o cadastro de advogado ao de um assessor. Entrando por
 // qualquer dos dois logins, a pessoa fica com as permissões somadas:
@@ -7359,12 +7460,40 @@ function agDonoCor(t){
   return '#9898A3';
 }
 function agNomeCurto(n){ const p = String(n || '').trim().split(/\s+/); return p.length > 1 ? p[0] + ' ' + p[p.length - 1] : (p[0] || ''); }
+// Advogado responsável pelo prazo: o dono da agenda, quem rejeitou o prazo para os assessores,
+// ou o advogado do cliente cujo número de processo aparece no título, assunto ou anotações.
+let _agIdxProc = { n: -1, mapa: new Map() };
+function _agIndiceProcessos(){
+  if (_agIdxProc.n === store.clientes.length) return _agIdxProc.mapa;
+  const mapa = new Map();
+  store.clientes.forEach(c => { const d = String(c.num_processo || '').replace(/\D/g, ''); if (d.length === 20 && c.adv_id) mapa.set(d, c); });
+  _agIdxProc = { n: store.clientes.length, mapa };
+  return mapa;
+}
+function agAdvResponsavel(t){
+  if (t.escopo === 'advogado' && t.adv_id) return { id: t.adv_id, via: 'agenda' };
+  if (t.origem_adv_id) return { id: t.origem_adv_id, via: 'rejeitado' };
+  const txt = [t.titulo, t.assunto, t.descricao].join(' ');
+  const m = txt.match(/\d{7}-?\d{2}\.?\d{4}\.?\d\.?\d{2}\.?\d{4}/g);
+  if (m) for (const x of m) { const c = _agIndiceProcessos().get(x.replace(/\D/g, '')); if (c) return { id: c.adv_id, via: 'processo', cliente: c.nome }; }
+  return null;
+}
 function agDonoCurto(t){
   if (t.escopo === 'advogado') return agNomeCurto((store.getAdv(t.adv_id) || {}).nome || 'Advogado');
   if (t.assessor_id) return agNomeCurto((store.getAssessor(t.assessor_id) || {}).nome || t.assessor_nome || 'Assessor');
   return t._presc ? 'Sem advogado' : 'Assessores';
 }
 
+function agLinhaResponsavel(t){
+  const dono = `<span class="agc-dono">${escHtml(agDonoCurto(t))}</span>`;
+  if (t.escopo === 'advogado') return dono;                 // na agenda de advogado o dono já é o responsável
+  const r = agAdvResponsavel(t);
+  if (!r) return dono;
+  const adv = store.getAdv(r.id); if (!adv) return dono;
+  const cor = agCorPessoa('adv:' + r.id);
+  const dica = r.via === 'rejeitado' ? 'Prazo rejeitado por este advogado' : 'Advogado responsável pelo processo' + (r.cliente ? ' (' + r.cliente + ')' : '');
+  return `${dono}<span class="agc-adv" style="color:${cor}" title="${escHtml(dica)}">⚖️ ${escHtml(agNomeCurto(adv.nome))}</span>`;
+}
 function agCardPresc(t, today){
   const el = document.createElement('div');
   const venc = t._dias < 0;
@@ -7392,7 +7521,7 @@ function agCard(t, today){
   el.innerHTML = `${rejBtn}
     <div class="agc-t">${t.hora ? `<span class="agc-h">${t.hora}</span>` : ''}<span class="agc-ico">${agTypeIcon(t.tipo)}</span>${escHtml(t.titulo)}</div>
     ${sub ? `<div class="agc-s">${escHtml(sub)}</div>` : ''}
-    <div class="agc-m"><span class="agc-dono">${escHtml(agDonoCurto(t))}</span>${st}${flags}${agSeloDataOriginal(t)}</div>`;
+    <div class="agc-m">${agLinhaResponsavel(t)}${st}${flags}${agSeloDataOriginal(t)}</div>`;
   el.title = [t.titulo, sub, t.descricao].filter(Boolean).join('\n');
   el.onclick = () => openEditAgenda(t.id);
   return el;
@@ -7677,6 +7806,7 @@ async function rejeitarAgenda(id){
   .agc.late{background:#FFF6F6;border-color:#F3D0D4;border-left-color:var(--c)}
   .agc.presc{background:#FFF9F3;border-color:#F5DFC8;border-left-color:var(--c)}
   .agc-presc{color:var(--red);font-weight:700}
+  .agc-adv{font-weight:600}
   .agc-orig{color:var(--info);font-weight:600;background:var(--info-bg);padding:0 5px;border-radius:4px}
   .agc-rej{position:absolute;top:4px;right:3px;border:none;background:transparent;color:var(--purple);font-size:13px;font-weight:800;cursor:pointer;padding:0 4px;border-radius:4px;opacity:0}
   .agc:hover .agc-rej{opacity:1}.agc-rej:hover{background:var(--purple-bg)}
