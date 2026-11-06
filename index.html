@@ -6861,114 +6861,129 @@ function renderAgenda(){
 
   if (v.scope === 'trabalhos'){ renderTrabalhos(v, selector); return; }
 
-  // Página = 15 dias úteis a partir de agendaWeekStart (fins de semana e feriados só aparecem se tiverem prazo)
-  const pag = agPaginaDias(agendaWeekStart);
-  const uteisPag = pag.filter(x => x.util);
-  const ini = uteisPag[0].date, fimUtil = uteisPag[uteisPag.length - 1].date;
-  const weekLbl = `${ini.toLocaleDateString('pt-BR',{day:'2-digit',month:'short'})} – ${fimUtil.toLocaleDateString('pt-BR',{day:'2-digit',month:'short',year:'numeric'})} · ${AG_DIAS_PAGINA} dias úteis`;
+  // Página = 3 semanas de segunda a sexta (15 dias úteis; feriados aparecem no lugar, em cinza)
+  agendaWeekStart = agMonday(agendaWeekStart);
+  const ini = agendaWeekStart, fimPag = agAddDays(ini, 20);
+  const pagDias = [];
+  for (let w = 0; w < AG_SEMANAS_PAGINA; w++) for (let i = 0; i < 7; i++) pagDias.push(agAddDays(ini, w * 7 + i));
+  const uteisNaPagina = pagDias.filter(agEhDiaUtilAgenda).length;
+  const fmtCurto = d => d.toLocaleDateString('pt-BR', { day:'2-digit', month:'short' }).replace('.', '');
+  const sextaFinal = agAddDays(ini, (AG_SEMANAS_PAGINA - 1) * 7 + 4);
+  const weekLbl = `${fmtCurto(ini)} – ${fmtCurto(sextaFinal)} ${sextaFinal.getFullYear()} · ${uteisNaPagina} dias úteis`;
 
   // estatísticas
   const items = agItemsFor(v);
   const today = new Date(); today.setHours(0,0,0,0);
-  const wkStartISO = agISO(pag[0].date), wkEndISO = agISO(pag[pag.length - 1].date);
-  const wk = items.filter(t => t.data >= wkStartISO && t.data <= wkEndISO);
+  // Prazo com data em fim de semana ou feriado aparece no último dia útil anterior
+  const exib = new Map(items.map(t => [t, t.data ? agDiaExibicao(t.data) : '']));
+  const wkStartISO = agISO(ini), wkEndISO = agISO(fimPag);
+  const wk = items.filter(t => exib.get(t) >= wkStartISO && exib.get(t) <= wkEndISO);
   const abertas = wk.filter(t => t.status !== 'concluida').length;
   const feitas  = wk.filter(t => t.status === 'concluida').length;
   const atras   = items.filter(t => t.status !== 'concluida' && t.data && new Date(t.data+'T'+(t.hora||'23:59')) < today).length;
 
   const hint = v.scope === 'todas'
-    ? 'Visão geral: todas as agendas (advogados e assessores). Cada prazo mostra de quem é. Você vê e edita tudo.'
+    ? 'Visão geral de todas as agendas. A cor da borda de cada prazo indica de quem é.'
     : v.scope === 'audiencias'
-    ? 'Audiências e atendimentos de clientes. Você (secretária) pode ver e agendar nas agendas dos advogados, escolhendo o responsável.'
+    ? 'Audiências e atendimentos de clientes. Você pode agendar nas agendas dos advogados, escolhendo o responsável.'
     : v.scope === 'assessor'
     ? 'Agenda de um assessor específico. Todos os assessores e o admin podem ver.'
     : v.scope === 'assessores'
-    ? 'Agenda dos assessores — cada prazo é de um assessor (ou sem responsável). Todos os assessores e o admin veem tudo; o nome mostra de quem é.'
+    ? 'Agenda dos assessores. Cada prazo é de um assessor ou fica sem responsável.'
     : (currentUser.tipo === 'admin' ? 'Agenda particular deste advogado. Só ele e o admin a enxergam.'
        : (currentUser.tipo === 'estagiario' || currentUser.tipo === 'estagiario_chefe') ? 'Você pode criar e editar prazos na agenda deste advogado.'
        : 'Sua agenda é particular: só você e o administrador a enxergam.');
 
+  // Legenda de cores (só quando há mais de um dono na tela)
+  const donos = new Map();
+  wk.forEach(t => { const k = agDonoChave(t); if (!donos.has(k)) donos.set(k, { cor: agDonoCor(t), nome: agDonoCurto(t) }); });
+  const legenda = donos.size > 1 ? `<div class="agl">${[...donos.values()].map(d => `<span class="agl-i"><i style="background:${d.cor}"></i>${escHtml(d.nome)}</span>`).join('')}</div>` : '';
+
   cont.innerHTML = `
-    <div class="ag-hint">📅 ${hint}</div>
     <div class="ag-toolbar">
       <div class="ag-left">
         ${selector}
         <div class="ag-nav">
-          <button class="btn btn-ghost btn-sm" onclick="agPrevWk()" title="${AG_DIAS_PAGINA} dias úteis anteriores">‹</button>
+          <button class="btn btn-ghost btn-sm" onclick="agPrevWk()" title="3 semanas anteriores">‹</button>
           <button class="btn btn-ghost btn-sm" onclick="agToday()">Hoje</button>
-          <button class="btn btn-ghost btn-sm" onclick="agNextWk()" title="Próximos ${AG_DIAS_PAGINA} dias úteis">›</button>
+          <button class="btn btn-ghost btn-sm" onclick="agNextWk()" title="Próximas 3 semanas">›</button>
         </div>
         <span class="ag-weeklabel">${weekLbl}</span>
       </div>
       <div class="ag-right">
-        ${['todas','advogado','assessores'].includes(v.scope) ? `<label style="display:flex;gap:6px;align-items:center;font-size:12px;font-weight:600;color:var(--gray-600);cursor:pointer;margin-right:6px"><input type="checkbox" style="width:auto" ${agMostrarPresc() ? 'checked' : ''} onchange="agTogglePresc(this.checked)"> ⏳ Prescrições</label>` : ''}
+        ${['todas','advogado','assessores'].includes(v.scope) ? `<label class="ag-chk"><input type="checkbox" ${agMostrarPresc() ? 'checked' : ''} onchange="agTogglePresc(this.checked)"> Prescrições</label>` : ''}
         <button class="btn btn-red btn-sm" onclick="openNewAgenda()"><svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>Novo prazo</button>
       </div>
     </div>
-    <div class="ag-stats">
-      <div class="ag-stat"><div class="n">${wk.length}</div><div class="l">No período</div></div>
-      <div class="ag-stat"><div class="n" style="color:var(--orange)">${abertas}</div><div class="l">Em aberto</div></div>
-      <div class="ag-stat"><div class="n" style="color:var(--success)">${feitas}</div><div class="l">Concluídas</div></div>
-      <div class="ag-stat"><div class="n" style="color:var(--red)">${atras}</div><div class="l">Atrasadas</div></div>
+    <div class="ag-sub">
+      <span class="ag-hint2">${hint}</span>
+      <span class="ag-kpis">
+        <span><b>${wk.length}</b> no período</span>
+        <span><b style="color:var(--orange)">${abertas}</b> em aberto</span>
+        <span><b style="color:var(--success)">${feitas}</b> concluídas</span>
+        <span class="${atras ? 'kpi-alerta' : ''}"><b style="color:var(--red)">${atras}</b> atrasadas</span>
+      </span>
     </div>
-    <div class="ag-week" id="ag-week"></div>`;
+    ${legenda}
+    <div class="agg-hd"><span>Segunda</span><span>Terça</span><span>Quarta</span><span>Quinta</span><span>Sexta</span></div>
+    <div id="ag-week"></div>`;
 
   const wkEl = $('ag-week');
-  wkEl.className = 'ag-pagina';
-  // Agrupa os dias da página em linhas por semana
-  const semanas = [];
-  pag.forEach(x => {
-    const iso = agISO(x.date);
-    const dayItems = items.filter(t => t.data === iso).sort((a,b)=>(a.hora||'99:99').localeCompare(b.hora||'99:99'));
-    if (!x.util && !dayItems.length) return;          // fim de semana/feriado vazio não aparece
-    const chave = agISO(agMonday(x.date));
-    let s = semanas.find(w => w.chave === chave);
-    if (!s) { s = { chave, dias: [] }; semanas.push(s); }
-    s.dias.push({ ...x, iso, dayItems });
-  });
-  semanas.forEach(s => {
-    const lbl = document.createElement('div'); lbl.className = 'ag-wklbl';
-    const seg = new Date(s.chave + 'T12:00:00');
-    lbl.textContent = 'Semana de ' + seg.toLocaleDateString('pt-BR', { day:'2-digit', month:'2-digit' });
-    wkEl.appendChild(lbl);
-    const row = document.createElement('div'); row.className = 'ag-wkrow';
-    row.style.setProperty('--n', Math.max(5, s.dias.length));
-    s.dias.forEach(({ date, util, iso, dayItems }) => {
-      const dow = date.getDay();
-      const fer = !util && dow !== 0 && dow !== 6;
-      const col = document.createElement('div');
-      col.className = 'ag-day' + (agSameDay(date,today)?' today':'') + (util?'':' naoutil');
-      col.innerHTML = `<div class="ag-day-hd"><span>${AG_DAYS[dow]} <small>${date.toLocaleDateString('pt-BR',{day:'2-digit',month:'2-digit'})}${fer ? ' · feriado' : (!util ? ' · fim de semana' : '')}</small></span><span class="ag-cnt">${dayItems.length}</span></div>`;
-      const list = document.createElement('div'); list.className = 'ag-cards';
-      if (!dayItems.length) list.innerHTML = '<div class="ag-empty">—</div>';
-      dayItems.forEach(t => list.appendChild(agCard(t, today)));
-      col.appendChild(list);
-      const add = document.createElement('div'); add.className='ag-add'; add.textContent='+ prazo';
-      add.onclick = () => openNewAgenda(iso);
-      col.appendChild(add);
-      row.appendChild(col);
-    });
-    wkEl.appendChild(row);
-  });
+  const ordena = arr => arr.sort((a,b) => (a._presc ? 1 : 0) - (b._presc ? 1 : 0) || (a.hora||'99:99').localeCompare(b.hora||'99:99'));
+  for (let w = 0; w < AG_SEMANAS_PAGINA; w++) {
+    const seg = agAddDays(ini, w * 7);
+    const grid = document.createElement('div'); grid.className = 'agg';
+    for (let i = 0; i < 5; i++) {
+      const date = agAddDays(seg, i), iso = agISO(date);
+      const dayItems = ordena(items.filter(t => exib.get(t) === iso));
+      const fer = !agEhDiaUtilAgenda(date);
+      const ehHoje = agSameDay(date, today), passado = date < today;
+      const cell = document.createElement('div');
+      cell.className = 'agd' + (ehHoje ? ' hoje' : '') + (fer ? ' fer' : '') + (passado ? ' passado' : '');
+      const mes = date.toLocaleDateString('pt-BR', { month:'short' }).replace('.', '');
+      cell.innerHTML = `<div class="agd-hd">
+          <span class="agd-dow">${AG_DAYS[date.getDay()]}</span>
+          <span class="agd-num">${String(date.getDate()).padStart(2,'0')}</span><span class="agd-mes">${mes}</span>
+          ${ehHoje ? '<span class="agd-tag hoje">hoje</span>' : ''}${fer ? '<span class="agd-tag">feriado</span>' : ''}
+          <span class="agd-r">${dayItems.length ? `<span class="agd-cnt">${dayItems.length}</span>` : ''}<button class="agd-add" title="Novo prazo neste dia">+</button></span>
+        </div>`;
+      cell.querySelector('.agd-add').onclick = e => { e.stopPropagation(); openNewAgenda(iso); };
+      const body = document.createElement('div'); body.className = 'agd-body';
+      dayItems.forEach(t => body.appendChild(agCard(t, today)));
+      cell.appendChild(body);
+      grid.appendChild(cell);
+    }
+    wkEl.appendChild(grid);
+  }
   const nb = $('nb-agenda');
   if (nb){ const tot = items.filter(t=>t.status!=='concluida').length; nb.textContent = tot; nb.style.display = tot? '' : 'none'; }
 }
 function agTypeIcon(t){ return t==='prescricao'?'⏳':t==='audiencia'?'🏛️':t==='cliente'?'👤':t==='reuniao'?'👥':t==='admin'?'🗂️':'⚖️'; }
+
+// ── Cor e nome curto do dono de cada prazo ──
+const AG_CORES_ADV = ['#C8102E','#1A5EC8','#0F8A5F','#C96A00','#0E7490','#9D174D','#4D7C0F','#6D28D9'];
+function agDonoChave(t){ return t.escopo === 'advogado' ? 'adv:' + t.adv_id : (t.assessor_id ? 'ass:' + t.assessor_id : (t._presc ? 'adv:none' : 'ass:none')); }
+function agDonoCor(t){
+  if (t.escopo === 'advogado' && t.adv_id) { const i = store.advogados.findIndex(a => a.id === t.adv_id); return AG_CORES_ADV[(i < 0 ? 0 : i) % AG_CORES_ADV.length]; }
+  return t.assessor_id ? '#7C3AED' : '#9898A3';
+}
+function agNomeCurto(n){ const p = String(n || '').trim().split(/\s+/); return p.length > 1 ? p[0] + ' ' + p[p.length - 1] : (p[0] || ''); }
+function agDonoCurto(t){
+  if (t.escopo === 'advogado') return agNomeCurto((store.getAdv(t.adv_id) || {}).nome || 'Advogado');
+  if (t.assessor_id) return agNomeCurto((store.getAssessor(t.assessor_id) || {}).nome || t.assessor_nome || 'Assessor');
+  return t._presc ? 'Sem advogado' : 'Assessores';
+}
+
 function agCardPresc(t, today){
   const el = document.createElement('div');
   const venc = t._dias < 0;
-  el.className = 'ag-card ag-presc' + (venc ? ' venc' : '');
-  el.style.borderLeftColor = t._dias <= 30 ? 'var(--red)' : 'var(--warn)';
-  const dono = t.adv_id ? '⚖️ ' + ((store.getAdv(t.adv_id) || {}).nome || 'Advogado') : '📂 Sem advogado';
-  const prazo = venc ? `<span class="ag-late">⚠ prescrito há ${Math.abs(t._dias)}d sem protocolo</span>`
-              : t._dias === 0 ? '<span class="ag-late">⚠ prescreve HOJE</span>'
-              : `<span class="ag-tag" style="background:var(--red-soft);color:var(--red)">faltam ${t._dias}d</span>`;
-  const extra = t._pend ? '<span class="ag-tag st-pendente">pré-entrevista pendente</span>'
-              : t._desist ? '<span class="ag-tag" style="background:var(--warn-bg);color:var(--warn)">desistência p/ reentrada</span>'
-              : '<span class="ag-tag" style="background:var(--gray-100);color:var(--gray-600)">sem protocolo</span>';
-  el.innerHTML = `<div class="ag-t">⏳ ${escHtml(t.titulo)}</div>
-    <div class="ag-meta"><span class="ag-who" style="color:var(--red)">${escHtml(dono)}</span>${prazo}${extra}${t.assunto ? `<span class="ag-tag" style="background:var(--info-bg);color:var(--info)">${escHtml(t.assunto)}</span>` : ''}</div>`;
-  el.title = 'Prescrição automática, tirada da ficha do cliente. Clique para abrir a ficha.';
+  el.className = 'agc presc' + (venc ? ' late' : '');
+  el.style.setProperty('--c', agDonoCor(t));
+  const quando = venc ? `prescrito há ${Math.abs(t._dias)}d` : t._dias === 0 ? 'prescreve hoje' : `faltam ${t._dias}d`;
+  const sit = t._pend ? 'pré-entrevista' : t._desist ? 'desist. p/ reentrada' : 'sem protocolo';
+  el.innerHTML = `<div class="agc-t"><span class="agc-ico">⏳</span>${escHtml(t.titulo.replace(/^Prescrição — /, ''))}</div>
+    <div class="agc-m"><span class="agc-presc">Prescrição · ${quando}</span><span class="agc-dono">${escHtml(agDonoCurto(t))}</span><span>${sit}</span>${agSeloDataOriginal(t)}</div>`;
+  el.title = `Prescrição automática (ficha do cliente)\n${t.titulo.replace(/^Prescrição — /, '')}${t.assunto ? ' ' + t.assunto : ''}\nClique para abrir a ficha.`;
   el.onclick = () => openDetail(t._clienteId);
   return el;
 }
@@ -6977,47 +6992,40 @@ function agCard(t, today){
   const el = document.createElement('div');
   const due = t.data ? new Date(t.data+'T'+(t.hora||'23:59')) : null;
   const late = due && t.status!=='concluida' && due < today && !agSameDay(due, today);
-  const prioCol = t.prioridade==='alta' ? 'var(--red)' : t.prioridade==='baixa' ? 'var(--success)' : 'var(--gray-200)';
-  el.className = 'ag-card' + (t.status==='concluida'?' done':'') + (late?' venc':'');
-  el.style.borderLeftColor = prioCol;
-  let stTag = t.status==='concluida' ? '<span class="ag-tag st-concluida">✓ feita</span>' : t.status==='andamento' ? '<span class="ag-tag st-em_andamento">andamento</span>' : '<span class="ag-tag st-pendente">aberta</span>';
-  const prioTag = t.prioridade==='alta' ? '<span class="ag-tag prio-critica">urgente</span>' : '';
-  const rejTag = t.rejeitado ? `<span class="ag-tag" style="background:var(--purple-bg);color:var(--purple)" title="Rejeitado de ${escHtml(t.origem_adv_nome||'advogado')}">⤳ rejeitado</span>` : '';
-  const rejBtn = agCanReject(t) ? `<button class="ag-rej" title="Rejeitar (enviar para os assessores)" onclick="event.stopPropagation();rejeitarAgenda('${t.id}')">⤳</button>` : '';
-  const dono = `<span class="ag-who" style="color:${agOwnerColor(t)}">${escHtml(agOwnerLabel(t))}</span>`;
-  const audTxt = [t.aud_tipo, t.aud_situacao, t.aud_modalidade].filter(Boolean).join(' · ');
-  const audChip = audTxt ? `<span class="ag-tag" style="background:var(--info-bg);color:var(--info)">${escHtml(audTxt)}</span>` : '';
-  const assChip = t.assunto ? `<span class="ag-tag" style="background:var(--info-bg);color:var(--info)">${escHtml(t.assunto)}</span>` : '';
+  el.className = 'agc' + (t.status==='concluida' ? ' done' : '') + (late ? ' late' : '') + (t.prioridade==='alta' && t.status!=='concluida' ? ' alta' : '');
+  el.style.setProperty('--c', agDonoCor(t));
+  const st = t.status==='concluida' ? '<span class="agc-ok">✓ feita</span>' : t.status==='andamento' ? '<span class="agc-and">em andamento</span>' : '';
+  const flags = (late ? '<span class="agc-late">atrasada</span>' : '') + (t.prioridade==='alta' && t.status!=='concluida' ? '<span class="agc-urg">urgente</span>' : '') + (t.rejeitado ? '<span class="agc-rej-tag" title="Rejeitado de ' + escHtml(t.origem_adv_nome||'advogado') + '">rejeitado</span>' : '');
+  const rejBtn = agCanReject(t) ? `<button class="agc-rej" title="Rejeitar (enviar para os assessores)" onclick="event.stopPropagation();rejeitarAgenda('${t.id}')">⤳</button>` : '';
+  const sub = t.tipo === 'audiencia' ? [t.aud_tipo, t.aud_modalidade].filter(Boolean).join(' · ') : (t.assunto || '');
   el.innerHTML = `${rejBtn}
-    <div class="ag-t">${agTypeIcon(t.tipo)} ${escHtml(t.titulo)}</div>
-    <div class="ag-meta">${dono}${t.hora?`<span class="ag-time">🕑 ${t.hora}</span>`:''}${late?'<span class="ag-late">⚠ atrasada</span>':''}${prioTag}${stTag}${audChip}${assChip}${rejTag}</div>`;
+    <div class="agc-t">${t.hora ? `<span class="agc-h">${t.hora}</span>` : ''}<span class="agc-ico">${agTypeIcon(t.tipo)}</span>${escHtml(t.titulo)}</div>
+    ${sub ? `<div class="agc-s">${escHtml(sub)}</div>` : ''}
+    <div class="agc-m"><span class="agc-dono">${escHtml(agDonoCurto(t))}</span>${st}${flags}${agSeloDataOriginal(t)}</div>`;
+  el.title = [t.titulo, sub, t.descricao].filter(Boolean).join('\n');
   el.onclick = () => openEditAgenda(t.id);
   return el;
 }
-// ── Paginação da agenda: 15 dias úteis por página ──
+// ── Paginação da agenda: 3 semanas (15 dias úteis) por página ──
+const AG_SEMANAS_PAGINA = 3;
 const AG_DIAS_PAGINA = 15;
 // Dia útil da agenda: segunda a sexta, fora feriados nacionais (o recesso forense não esconde dias da agenda)
 function agEhDiaUtilAgenda(d){ const w = d.getDay(); if (w === 0 || w === 6) return false; return !agFeriados(d.getFullYear()).has(agISOd(d)); }
-// Dias da página a partir de "inicio": os 15 úteis + os não úteis no meio e logo depois,
-// até o próximo útil, para que nenhum dia fique fora de todas as páginas
-function agPaginaDias(inicio){
-  const out = []; let d = new Date(inicio); d.setHours(0,0,0,0); let uteis = 0, guarda = 0;
-  while (uteis < AG_DIAS_PAGINA && guarda++ < 120) {
-    const u = agEhDiaUtilAgenda(d); out.push({ date: new Date(d), util: u }); if (u) uteis++;
-    d = agAddDays(d, 1);
-  }
-  while (!agEhDiaUtilAgenda(d) && guarda++ < 140) { out.push({ date: new Date(d), util: false }); d = agAddDays(d, 1); }
-  return out;
+// Último dia útil na data ou antes dela (sábado, domingo e feriado nacional recuam)
+function agDiaExibicao(iso){
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(iso || '')) return iso || '';
+  let d = new Date(iso + 'T12:00:00'), guarda = 0;
+  while (!agEhDiaUtilAgenda(d) && guarda++ < 15) d = agAddDays(d, -1);
+  return agISOd(d);
 }
-function agPrevWk(){
-  let d = agAddDays(agendaWeekStart, -1), uteis = 0, guarda = 0;
-  while (guarda++ < 120) { if (agEhDiaUtilAgenda(d) && ++uteis === AG_DIAS_PAGINA) break; d = agAddDays(d, -1); }
-  agendaWeekStart = d; renderAgenda();
+function agSeloDataOriginal(t){
+  if (!t.data || agDiaExibicao(t.data) === t.data) return '';
+  const d = new Date(t.data + 'T12:00:00');
+  const motivo = (d.getDay() === 0 || d.getDay() === 6) ? AG_DAYS[d.getDay()].toLowerCase() : 'feriado';
+  return `<span class="agc-orig" title="A data lançada (${fmtDate(t.data)}) não é dia útil; o prazo aparece no último dia útil anterior.">data real ${fmtDate(t.data).slice(0,5)} (${motivo})</span>`;
 }
-function agNextWk(){
-  const pag = agPaginaDias(agendaWeekStart);
-  agendaWeekStart = agAddDays(pag[pag.length - 1].date, 1); renderAgenda();
-}
+function agPrevWk(){ agendaWeekStart = agAddDays(agMonday(agendaWeekStart), -7 * AG_SEMANAS_PAGINA); renderAgenda(); }
+function agNextWk(){ agendaWeekStart = agAddDays(agMonday(agendaWeekStart), 7 * AG_SEMANAS_PAGINA); renderAgenda(); }
 function agToday(){ agendaWeekStart = agMonday(new Date()); renderAgenda(); }
 
 // Mostra os campos extras conforme o tipo: Audiência (subcategorias) / Prazo (assunto)
@@ -7235,6 +7243,56 @@ async function rejeitarAgenda(id){
   .ag-add{margin:8px;border:1.5px dashed var(--gray-200);background:var(--gray-50);color:var(--gray-400);border-radius:var(--r-sm);padding:7px;font-size:12px;font-weight:700;text-align:center;cursor:pointer}
   .ag-add:hover{border-color:var(--red);color:var(--red)}
   @media(max-width:760px){.ag-stats{grid-template-columns:repeat(2,1fr)}.ag-week{grid-template-columns:1fr}.ag-wkrow{grid-template-columns:1fr}}
+  /* ── Agenda: grade de 3 semanas ── */
+  .ag-chk{display:flex;gap:6px;align-items:center;font-size:12px;font-weight:600;color:var(--gray-600);cursor:pointer;padding:6px 10px;border:1.5px solid var(--gray-100);border-radius:var(--r-xs);background:#fff;margin:0}
+  .ag-chk input{width:auto;accent-color:var(--red);margin:0}
+  .ag-sub{display:flex;justify-content:space-between;align-items:center;gap:8px 16px;flex-wrap:wrap;margin:-4px 0 12px;font-size:12px;color:var(--gray-400)}
+  .ag-kpis{display:flex;gap:16px;flex-wrap:wrap;color:var(--gray-600)}
+  .ag-kpis b{font-size:15px;font-weight:800;margin-right:3px;color:var(--gray-900)}
+  .agl{display:flex;flex-wrap:wrap;gap:6px 14px;margin-bottom:10px;font-size:11.5px;color:var(--gray-600)}
+  .agl-i{display:inline-flex;align-items:center;gap:6px}.agl-i i{width:10px;height:10px;border-radius:3px;display:inline-block}
+  .agg-hd,.agg{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px}
+  .agg-hd{position:sticky;top:58px;z-index:5;background:var(--off);padding:6px 4px;font-size:10.5px;font-weight:700;color:var(--gray-400);text-transform:uppercase;letter-spacing:.7px}
+  .agg{margin-bottom:12px}
+  .agd{background:#fff;border:1px solid var(--gray-100);border-radius:10px;min-height:120px;display:flex;flex-direction:column;transition:border-color .15s}
+  .agd:hover{border-color:var(--gray-200)}
+  .agd-hd{display:flex;align-items:center;gap:5px;padding:8px 8px 6px 10px}
+  .agd-dow{display:none;font-size:11px;font-weight:700;color:var(--gray-400);text-transform:uppercase}
+  .agd-num{font-size:17px;font-weight:700;color:var(--gray-900);letter-spacing:-.5px;line-height:1}
+  .agd-mes{font-size:11px;color:var(--gray-400)}
+  .agd-tag{font-size:9.5px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:var(--gray-600);background:var(--gray-100);border-radius:4px;padding:2px 5px}
+  .agd-tag.hoje{background:var(--red);color:#fff}
+  .agd-r{margin-left:auto;display:flex;align-items:center;gap:2px}
+  .agd-cnt{font-size:10.5px;font-weight:700;color:var(--gray-600);background:var(--gray-50);border-radius:99px;padding:1px 7px}
+  .agd-add{width:22px;height:22px;border-radius:6px;border:none;background:transparent;color:var(--gray-400);font-size:17px;line-height:1;cursor:pointer;opacity:0;transition:.15s}
+  .agd:hover .agd-add{opacity:1}.agd-add:hover{background:var(--red-soft);color:var(--red)}
+  .agd-body{padding:0 6px 6px;display:flex;flex-direction:column;gap:5px}
+  .agd.hoje{border:1.5px solid var(--red);background:#FFFBFB}
+  .agd.passado .agd-num{color:var(--gray-400)}
+  .agd.fer{background:repeating-linear-gradient(135deg,#FAFAFB 0 8px,#F2F2F4 8px 16px)}
+  .agc{position:relative;background:#fff;border:1px solid var(--gray-100);border-left:3px solid var(--c,#9898A3);border-radius:7px;padding:6px 8px;cursor:pointer;transition:box-shadow .12s,transform .12s}
+  .agc:hover{box-shadow:0 2px 10px rgba(0,0,0,.08);transform:translateY(-1px)}
+  .agc-t{font-size:12.5px;font-weight:600;line-height:1.3;color:var(--gray-900);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;word-break:break-word;padding-right:12px}
+  .agc-h{font-weight:700;color:var(--c);margin-right:5px;font-variant-numeric:tabular-nums}
+  .agc-ico{margin-right:4px;font-size:11px}
+  .agc-s{font-size:11px;color:var(--gray-400);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .agc-m{display:flex;flex-wrap:wrap;gap:3px 8px;margin-top:4px;font-size:10.5px;color:var(--gray-400);align-items:center}
+  .agc-dono{color:var(--c);font-weight:600}
+  .agc-ok{color:var(--success);font-weight:600}.agc-and{color:var(--info);font-weight:600}
+  .agc-late{color:var(--red);font-weight:700}
+  .agc-urg{color:var(--red);font-weight:700;background:var(--red-soft);padding:0 5px;border-radius:4px}
+  .agc-rej-tag{color:var(--purple);font-weight:600}
+  .agc.done{opacity:.55}.agc.done .agc-t{text-decoration:line-through;color:var(--gray-600)}
+  .agc.late{background:#FFF6F6;border-color:#F3D0D4;border-left-color:var(--c)}
+  .agc.presc{background:#FFF9F3;border-color:#F5DFC8;border-left-color:var(--c)}
+  .agc-presc{color:var(--red);font-weight:700}
+  .agc-orig{color:var(--info);font-weight:600;background:var(--info-bg);padding:0 5px;border-radius:4px}
+  .agc-rej{position:absolute;top:4px;right:3px;border:none;background:transparent;color:var(--purple);font-size:13px;font-weight:800;cursor:pointer;padding:0 4px;border-radius:4px;opacity:0}
+  .agc:hover .agc-rej{opacity:1}.agc-rej:hover{background:var(--purple-bg)}
+  .agfds{display:flex;gap:10px;align-items:flex-start;margin:-4px 0 12px;padding:6px 8px;border:1px dashed var(--gray-200);border-radius:8px;background:#fff}
+  .agfds-lbl{font-size:10.5px;font-weight:700;color:var(--gray-400);text-transform:uppercase;white-space:nowrap;padding-top:6px}
+  .agfds-box{display:flex;flex-wrap:wrap;gap:6px}.agfds-box .agc{width:240px}
+  @media(max-width:900px){.agg-hd{display:none}.agg{grid-template-columns:1fr;gap:6px}.agd{min-height:0}.agd-dow{display:inline}.agd-add{opacity:1}.agfds{flex-direction:column}}
   `;
   const s = document.createElement('style'); s.textContent = css; document.head.appendChild(s);
 })();
@@ -7620,19 +7678,25 @@ async function checarLembretesNotif(){
   if (!ev.hoje && !ev.amanha && !ev.atrasados && !ev.umahora) return;
   const agoraD = new Date();
   const hoje = agISOd(agoraD);
-  const amanhaD = new Date(agoraD); amanhaD.setDate(amanhaD.getDate() + 1);
-  const amanha = agISOd(amanhaD);
+  // Próximo dia útil (prazo em fim de semana/feriado conta no último dia útil anterior)
+  let proxD = new Date(agoraD); proxD.setHours(12,0,0,0);
+  do { proxD = agAddDays(proxD, 1); } while (!agEhDiaUtilAgenda(proxD));
+  const amanha = agISOd(proxD);
+  const ehAmanhaMesmo = agISOd(agAddDays(new Date(agoraD.getFullYear(), agoraD.getMonth(), agoraD.getDate(), 12), 1)) === amanha;
+  const limiteBusca = agISOd(agAddDays(proxD, 7));
   try {
     const [rProx, rAtr] = await Promise.all([
-      sb.from('agenda').select('*').in('data', [hoje, amanha]).neq('status', 'concluida'),
+      sb.from('agenda').select('*').gte('data', hoje).lte('data', limiteBusca).neq('status', 'concluida'),
       ev.atrasados ? sb.from('agenda').select('*').lt('data', hoje).neq('status', 'concluida') : Promise.resolve({ data: [] })
     ]);
-    const prox = (rProx.data || []).filter(t => _notifPrazoRelevante(t, p));
+    const prox = (rProx.data || []).filter(t => _notifPrazoRelevante(t, p))
+      .map(t => ({ ...t, _exib: agDiaExibicao(t.data) }))
+      .filter(t => t._exib === hoje || t._exib === amanha || t.data === hoje);
     const atrasados = (rAtr.data || []).filter(t => _notifPrazoRelevante(t, p));
 
     // Vence hoje (um aviso por dia)
     if (ev.hoje) {
-      const deHoje = prox.filter(t => t.data === hoje && !_notifJaVisto(`hoje:${t.id}:${hoje}`));
+      const deHoje = prox.filter(t => t._exib === hoje && !_notifJaVisto(`hoje:${t.id}:${hoje}`));
       if (deHoje.length > 3) {
         enviarNotif(`⏰ ${deHoje.length} prazos vencem HOJE`, deHoje.slice(0, 4).map(t => '• ' + t.titulo + (t.hora ? ' (' + t.hora + ')' : '')).join('\n') + (deHoje.length > 4 ? '\n…' : ''),
           { tag: 'mz-hoje', urgente: true, onclick: () => _notifAbrirPrazo(null) });
@@ -7645,9 +7709,10 @@ async function checarLembretesNotif(){
 
     // Vence amanhã (um aviso agrupado por dia)
     if (ev.amanha) {
-      const deAmanha = prox.filter(t => t.data === amanha && !_notifJaVisto(`amanha:${t.id}:${hoje}`));
+      const deAmanha = prox.filter(t => t._exib === amanha && !_notifJaVisto(`amanha:${t.id}:${hoje}`));
+      const quandoTxt = ehAmanhaMesmo ? 'amanhã' : 'no próximo dia útil (' + fmtDate(amanha).slice(0,5) + ')';
       if (deAmanha.length) {
-        enviarNotif(deAmanha.length === 1 ? '📅 Vence amanhã' : `📅 ${deAmanha.length} prazos vencem amanhã`,
+        enviarNotif(deAmanha.length === 1 ? '📅 Vence ' + quandoTxt : `📅 ${deAmanha.length} prazos vencem ${quandoTxt}`,
           deAmanha.length === 1 ? _notifDescPrazo(deAmanha[0]) : deAmanha.slice(0, 4).map(t => '• ' + t.titulo).join('\n') + (deAmanha.length > 4 ? '\n…' : ''),
           { tag: 'mz-amanha', onclick: () => _notifAbrirPrazo(deAmanha.length === 1 ? deAmanha[0].id : null) });
         _notifMarcar(deAmanha.map(t => `amanha:${t.id}:${hoje}`));
