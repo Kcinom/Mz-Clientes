@@ -772,8 +772,8 @@ body:has(#pre-screen[style*="flex"]) #app { display: none !important; }
     </div>
     <div class="page" id="page-clientes">
       <div class="filters-bar">
-        <div class="search-wrap"><svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg><input type="text" id="search-input" placeholder="Buscar por nome, CPF, reclamada…" oninput="renderClients()"></div>
-        <select class="flt-select" id="filter-sort" onchange="renderClients()">
+        <div class="search-wrap"><svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg><input type="text" id="search-input" placeholder="Buscar por nome, CPF, reclamada…" oninput="_cliBuscaDigitada()"></div>
+        <select class="flt-select" id="filter-sort" onchange="_cliLimite={};renderClients()">
           <option value="urgency">🔴 Por urgência</option>
           <option value="alpha">🔤 A → Z</option>
           <option value="recent">🕐 Mais recentes</option>
@@ -782,7 +782,7 @@ body:has(#pre-screen[style*="flex"]) #app { display: none !important; }
           <option value="tipo">📋 Agrupar: Tipo Rescisão</option>
           <option value="adv">👤 Agrupar: Advogado</option>
         </select>
-        <select class="flt-select" id="filter-status" onchange="renderClients()">
+        <select class="flt-select" id="filter-status" onchange="_cliLimite={};renderClients()">
           <option value="all">Todos os status</option>
           <option value="pendente">Pendentes</option>
           <option value="ativo">Ativos</option>
@@ -792,7 +792,7 @@ body:has(#pre-screen[style*="flex"]) #app { display: none !important; }
           <option value="prescrito">Prescritos</option>
           <option value="rejeitado">Rejeitados</option>
         </select>
-        <select class="flt-select" id="filter-adv" onchange="renderClients()">
+        <select class="flt-select" id="filter-adv" onchange="_cliLimite={};renderClients()">
           <option value="all">Todos os advogados</option>
         </select>
       </div>
@@ -2010,6 +2010,19 @@ create table if not exists feriados_locais (
   created_at timestamptz default now()
 );
 alter table feriados_locais disable row level security;
+
+-- Desempenho: data da última alteração em clientes e agenda, preenchida pelo banco.
+-- Permite ao sistema buscar só o que mudou, em vez da tabela inteira.
+alter table clientes add column if not exists atualizado_em timestamptz default now();
+create or replace function mz_set_atualizado_em() returns trigger as $$
+begin new.atualizado_em = now(); return new; end; $$ language plpgsql;
+drop trigger if exists trg_clientes_atualizado on clientes;
+create trigger trg_clientes_atualizado before insert or update on clientes for each row execute function mz_set_atualizado_em();
+drop trigger if exists trg_agenda_atualizado on agenda;
+create trigger trg_agenda_atualizado before insert or update on agenda for each row execute function mz_set_atualizado_em();
+create index if not exists idx_clientes_atualizado on clientes(atualizado_em);
+create index if not exists idx_agenda_atualizado on agenda(atualizado_em);
+create index if not exists idx_agenda_data on agenda(data);
 `;
 
 const ADMIN_EMAIL = 'mztransclicao@gmail.com';
@@ -2194,47 +2207,87 @@ function showSetup() {
 const store = {
   advogados: [], secretarias: [], estagiarios: [], estagiarios_chefes: [], assessores: [], clientes: [], tokens: [], auditLog: [], tarefas: [], agenda: [], feriados_locais: [],
 
+  // Consulta de cada tabela com ordenação estável (necessária para buscar em páginas)
+  _consulta(t, cols = '*') {
+    let q = sb.from(t).select(cols);
+    if (t === 'clientes')  q = q.order('criado_em', { ascending: false }).order('id');
+    if (t === 'advogados' || t === 'secretarias' || t === 'estagiarios' || t === 'estagiarios_chefes' || t === 'assessores') q = q.order('nome').order('id');
+    if (t === 'tokens')    q = q.order('criado_em', { ascending: false }).order('id');
+    if (t === 'audit_log') q = q.order('data', { ascending: false }).limit(300);
+    if (t === 'tarefas')   q = q.order('criado_em', { ascending: false }).order('id');
+    if (t === 'agenda')    q = q.order('data', { ascending: true }).order('id');
+    if (t === 'feriados_locais') q = q.order('comarca').order('id');
+    return q;
+  },
+  // O Supabase entrega no máximo 1.000 linhas por consulta: busca em páginas até trazer tudo
+  async _buscarTudo(t) {
+    if (t === 'audit_log') { const { data } = await this._consulta(t); return data || []; }
+    const PAG = 1000; let todos = [];
+    for (let de = 0; de < 100000; de += PAG) {
+      const { data, error } = await this._consulta(t).range(de, de + PAG - 1);
+      if (error) { console.warn('[carga]', t, error.message); break; }
+      todos = todos.concat(data || []);
+      if (!data || data.length < PAG) break;
+    }
+    return todos;
+  },
+  _guardar(t, data) { if (t === 'audit_log') this.auditLog = data; else this[t] = data; },
+
   async load() {
-    const [a, s, e, ec, c, t, al, al2, ass, ag, fl] = await Promise.all([
-      sb.from('advogados').select('*').order('nome'),
-      sb.from('secretarias').select('*').order('nome'),
-      sb.from('estagiarios').select('*').order('nome'),
-      sb.from('estagiarios_chefes').select('*').order('nome'),
-      sb.from('clientes').select('*').order('criado_em', { ascending: false }),
-      sb.from('tokens').select('*').order('criado_em', { ascending: false }),
-      sb.from('audit_log').select('*').order('data', { ascending: false }).limit(300),
-      sb.from('tarefas').select('*').order('criado_em', { ascending: false }),
-      sb.from('assessores').select('*').order('nome'),
-      sb.from('agenda').select('*').order('data', { ascending: true }),
-      sb.from('feriados_locais').select('*').order('comarca'),
-    ]);
-    this.advogados   = a.data || [];
-    this.secretarias = s.data || [];
-    this.estagiarios = e.data || [];
-    this.estagiarios_chefes = ec.data || [];
-    this.clientes    = c.data || [];
-    this.tokens      = t.data || [];
-    this.auditLog    = al.data || [];
-    this.tarefas     = al2.data || [];
-    this.assessores  = ass.data || [];
-    this.agenda      = ag.data || [];
-    this.feriados_locais = fl.data || [];
+    const tabs = ['advogados','secretarias','estagiarios','estagiarios_chefes','clientes','tokens','audit_log','tarefas','assessores','agenda','feriados_locais'];
+    const res = await Promise.all(tabs.map(t => this._buscarTudo(t)));
+    tabs.forEach((t, i) => this._guardar(t, res[i]));
+    ['clientes','agenda'].forEach(t => this._marcarSync(t));
   },
 
   async reload(tables = ['clientes']) {
-    for (const t of tables) {
-      let q = sb.from(t).select('*');
-      if (t === 'clientes')  q = q.order('criado_em', { ascending: false });
-      if (t === 'advogados' || t === 'secretarias' || t === 'estagiarios' || t === 'estagiarios_chefes' || t === 'assessores') q = q.order('nome');
-      if (t === 'tokens')    q = q.order('criado_em', { ascending: false });
-      if (t === 'audit_log') q = q.order('data', { ascending: false }).limit(300);
-      if (t === 'tarefas')   q = q.order('criado_em', { ascending: false });
-      if (t === 'agenda')    q = q.order('data', { ascending: true });
-      if (t === 'feriados_locais') q = q.order('comarca');
-      const { data } = await q;
-      if (t === 'audit_log') this.auditLog = data || [];
-      else this[t] = data || [];
+    const res = await Promise.all(tables.map(t => this._buscarTudo(t)));
+    tables.forEach((t, i) => { this._guardar(t, res[i]); if (t === 'clientes' || t === 'agenda') this._marcarSync(t); });
+  },
+
+  // ── Atualização incremental: só busca o que mudou desde a última vez (coluna atualizado_em) ──
+  _sync: {},
+  _marcarSync(t) {
+    const st = this._sync[t] || (this._sync[t] = {});
+    st.full = Date.now();
+    let m = null, temCol = false;
+    (this[t] || []).forEach(r => { if ('atualizado_em' in r) temCol = true; if (r.atualizado_em && (!m || r.atualizado_em > m)) m = r.atualizado_em; });
+    st.ultimo = m; st.semColuna = (this[t] || []).length > 0 && !temCol;
+  },
+  // Devolve true se algo mudou. Recarga completa a cada 5 min (pega exclusões);
+  // sem a coluna atualizado_em, recarrega tudo no máximo a cada 60 s.
+  async sync(t) {
+    const st = this._sync[t] || {};
+    const agora = Date.now();
+    const assinatura = () => (this[t] || []).length;
+    if (st.semColuna) {
+      if (agora - (st.full || 0) < 60000) return false;
+      const antes = JSON.stringify(this[t]); await this.reload([t]); return antes !== JSON.stringify(this[t]);
     }
+    if (!st.ultimo || agora - (st.full || 0) > 5 * 60000) {
+      const n = assinatura(), antes = st.ultimo; await this.reload([t]);
+      return n !== assinatura() || antes !== this._sync[t].ultimo;
+    }
+    const desde = new Date(Date.parse(st.ultimo) - 120000).toISOString();
+    const { data, error } = await sb.from(t).select('*').gt('atualizado_em', desde).limit(1000);
+    if (error) { st.semColuna = true; return false; }
+    return this.aplicar(t, data || []);
+  },
+  // Aplica linhas novas ou alteradas sem baixar a tabela inteira
+  aplicar(t, linhas, removidos = []) {
+    let mudou = false;
+    const lista = this[t] || (this[t] = []);
+    const idx = new Map(lista.map((r, i) => [r.id, i]));
+    linhas.forEach(r => {
+      if (!r || !r.id) return;
+      const i = idx.get(r.id);
+      if (i === undefined) { lista.unshift(r); mudou = true; }
+      else if (JSON.stringify(lista[i]) !== JSON.stringify(r)) { lista[i] = r; mudou = true; }
+    });
+    if (removidos.length) { const s = new Set(removidos); const n = lista.length; this[t] = lista.filter(r => !s.has(r.id)); mudou = mudou || n !== this[t].length; }
+    const st = this._sync[t] || (this._sync[t] = {});
+    (this[t] || []).forEach(r => { if (r.atualizado_em && (!st.ultimo || r.atualizado_em > st.ultimo)) st.ultimo = r.atualizado_em; });
+    return mudou;
   },
 
   async addAudit(acao, clienteId, clienteNome, detalhes = '') {
@@ -2799,7 +2852,18 @@ async function bootApp() {
   loading(false);
   // Atualiza permissões da sessão salva (o admin pode ter mudado desde o último acesso)
   try {
-    if (currentUser.tipo === 'assessor') { const r = store.getAssessor(currentUser.id); if (r) currentUser.perms = r.perms || {}; }
+    if (currentUser.tipo === 'advogado') {
+      // Cadastro de advogado juntado a um assessor: entra como a conta unificada
+      const ass = store.assessores.find(a => a.perms && a.perms.advVinculado === currentUser.advId);
+      if (ass) currentUser = { tipo:'assessor', nome: ass.nome, email: ass.email, id: ass.id, perms: ass.perms || {}, advId: currentUser.advId, oab: currentUser.oab || '' };
+    }
+    if (currentUser.tipo === 'assessor') {
+      const r = store.getAssessor(currentUser.id);
+      if (r) currentUser.perms = r.perms || {};
+      const vinc = currentUser.perms && currentUser.perms.advVinculado;
+      currentUser.advId = (vinc && store.getAdv(vinc)) ? vinc : null;
+      if (currentUser.advId) currentUser.oab = (store.getAdv(currentUser.advId) || {}).oab || '';
+    }
     if (currentUser.tipo === 'estagiario') { const r = store.getEst(currentUser.id); if (r) { currentUser.perms = r.perms || {}; currentUser.advId = r.adv_id; } }
     localStorage.setItem('mz_sessao', JSON.stringify(currentUser));
   } catch(e) {}
@@ -2810,7 +2874,8 @@ async function bootApp() {
   const ini = currentUser.nome.split(' ').slice(0, 2).map(n => n[0]).join('').toUpperCase();
   $('sb-ava').textContent = ini;
   $('sb-name').textContent = currentUser.nome;
-  $('sb-role').textContent = { admin: 'Administrador', advogado: 'Advogado(a)', secretaria: 'Secretária', estagiario: 'Estagiário', estagiario_chefe: 'Estagiário Chefe', assessor: 'Assessor(a)' }[currentUser.tipo] || '';
+  $('sb-role').textContent = (currentUser.tipo === 'assessor' && currentUser.advId) ? 'Assessor(a) · Advogado(a)'
+    : ({ admin: 'Administrador', advogado: 'Advogado(a)', secretaria: 'Secretária', estagiario: 'Estagiário', estagiario_chefe: 'Estagiário Chefe', assessor: 'Assessor(a)' }[currentUser.tipo] || '');
 
   // ── Agenda: visível para todos os papéis operacionais ──
   if ($('nav-agenda-sec')) $('nav-agenda-sec').style.display = can.viewAgenda(currentUser) ? '' : 'none';
@@ -3373,12 +3438,27 @@ function renderClients() {
   cont.innerHTML = html;
 }
 
+// Cada bloco desenha no máximo CLI_POR_BLOCO linhas; o resto vem em "Mostrar mais".
+// Desenhar mais de mil linhas de uma vez é o que deixava a tela lenta.
+const CLI_POR_BLOCO = 100;
+let _cliLimite = {};
+function _cliMais(chaveCod){ const chave = decodeURIComponent(chaveCod); _cliLimite[chave] = (_cliLimite[chave] || CLI_POR_BLOCO) + 200; renderClients(); }
+// Busca: espera a pessoa parar de digitar antes de redesenhar a lista
+let _cliBuscaTimer = null;
+function _cliBuscaDigitada(){ clearTimeout(_cliBuscaTimer); _cliBuscaTimer = setTimeout(() => { _cliLimite = {}; renderClients(); }, 250); }
+function _cliRodape(chave, total, lim){
+  if (total <= lim) return '';
+  return `<div style="padding:12px;text-align:center;border-top:1px solid var(--gray-100)">
+    <button class="btn btn-ghost btn-sm" onclick="_cliMais('${encodeURIComponent(chave).replace(/'/g, '%27')}')">Mostrar mais ${Math.min(200, total - lim)} de ${total - lim} restantes</button></div>`;
+}
 function statusBlock(st, title, list, col4) {
+  const lim = _cliLimite['st:' + st] || CLI_POR_BLOCO;
   return `<div class="clients-block">
     <div class="block-head ${st}"><h3>${title}</h3><span class="badge ${stBadge(st)}">${list.length}</span></div>
     <div class="tbl-wrap">
       <div class="tbl-head"><span>Cliente</span><span>Reclamada / Função</span><span>Tipo Rescisão</span><span>${col4}</span><span>Urgência</span><span>Advogado</span><span></span></div>
-      ${list.map(c => clientRow(c, st)).join('')}
+      ${list.slice(0, lim).map(c => clientRow(c, st)).join('')}
+      ${_cliRodape('st:' + st, list.length, lim)}
     </div>
   </div>`;
 }
@@ -3393,7 +3473,8 @@ function renderGrouped(list, by, cont) {
     <div class="clients-block">
       <div class="block-head grouped"><h3>${k}</h3><span class="badge b-gray">${groups[k].length}</span></div>
       <div class="tbl-wrap"><div class="tbl-head"><span>Cliente</span><span>Reclamada / Função</span><span>Tipo Rescisão</span><span>Prescrição</span><span>Urgência</span><span>Advogado</span><span></span></div>
-      ${groups[k].map(c => clientRow(c)).join('')}
+      ${groups[k].slice(0, _cliLimite['gr:' + k] || CLI_POR_BLOCO).map(c => clientRow(c)).join('')}
+      ${_cliRodape('gr:' + k, groups[k].length, _cliLimite['gr:' + k] || CLI_POR_BLOCO)}
     </div></div>`).join('');
 }
 
@@ -4097,7 +4178,7 @@ function renderAdvogados() {
     const urg = store.clientes.filter(c => c.adv_id === a.id && urgencia(c) === 1 && c.status === 'ativo').length;
     return `<div class="adv-card">
       <div class="adv-card-hd"><div class="adv-ava">${a.nome[0].toUpperCase()}</div>
-        <div><div class="adv-name">${a.nome}</div><div class="adv-meta">${a.oab ? 'OAB ' + a.oab : 'Sem OAB'}</div><div class="adv-meta">${a.email ? a.email : '🔓 Sem login'}</div></div></div>
+        <div><div class="adv-name">${a.nome}</div><div class="adv-meta">${a.oab ? 'OAB ' + a.oab : 'Sem OAB'}</div><div class="adv-meta">${a.email ? a.email : '🔓 Sem login'}</div>${(() => { const s = store.assessores.find(x => x.perms && x.perms.advVinculado === a.id); return s ? `<div class="adv-meta" style="color:var(--success);font-weight:600">🔗 Também assessor(a): ${escHtml(s.nome)}</div>` : ''; })()}</div></div>
       <div class="adv-stats">
         <div class="adv-stat"><strong>${qtd}</strong><span>Clientes</span></div>
         <div class="adv-stat"><strong style="color:var(--red)">${urg}</strong><span>Urgentes</span></div>
@@ -6481,7 +6562,12 @@ function hideDjNotif() {}
 function advsVisiveisDe(u){
   if (!u) return null;
   const v = u.perms ? u.perms.advsVisiveis : undefined;
-  if (u.tipo === 'assessor') return Array.isArray(v) ? new Set(v) : null;
+  if (u.tipo === 'assessor') {
+    if (!Array.isArray(v)) return null;
+    const s = new Set(v);
+    if (u.advId) s.add(u.advId);            // cadastro de advogado vinculado: sempre vê os próprios clientes
+    return s;
+  }
   if (u.tipo === 'estagiario') {
     if (v === null) return null;
     if (Array.isArray(v)) return new Set(v);
@@ -6570,6 +6656,73 @@ async function salvarAdvsVisiveis(){
 }
 
 // ══════════════════════════════════════════════════════════════════
+// ░░ VÍNCULO ASSESSOR + ADVOGADO (mesma pessoa, um login só) ░░
+// O admin junta o cadastro de advogado ao de um assessor. Entrando por
+// qualquer dos dois logins, a pessoa fica com as permissões somadas:
+// agenda dos assessores + a própria agenda de advogado, os próprios clientes
+// e a mesma cor na agenda. Guardado em assessores.perms.advVinculado.
+// ══════════════════════════════════════════════════════════════════
+let _vincAlvo = null;
+function abrirVinculoAdv(assId){
+  if (!currentUser || currentUser.tipo !== 'admin') { toast('⛔ Apenas o administrador faz esse vínculo'); return; }
+  const s = store.getAssessor(assId); if (!s) return;
+  _vincAlvo = assId;
+  const atual = (s.perms || {}).advVinculado || '';
+  const ocupados = new Map(store.assessores.filter(x => x.id !== assId && x.perms && x.perms.advVinculado).map(x => [x.perms.advVinculado, x.nome]));
+  const nomeN = n => _notifNorm(n).replace(/^(dr|dra)\.?\s+/, '').trim();
+  const sugerido = !atual && store.advogados.find(a => !ocupados.has(a.id) && ((a.email && s.email && a.email.toLowerCase() === s.email.toLowerCase()) || nomeN(a.nome) === nomeN(s.nome)));
+  const opts = store.advogados.map(a => {
+    const dono = ocupados.get(a.id);
+    return `<option value="${a.id}" ${a.id === (atual || (sugerido && sugerido.id)) ? 'selected' : ''} ${dono ? 'disabled' : ''}>${escHtml(a.nome)}${a.oab ? ' · OAB ' + escHtml(a.oab) : ''}${dono ? ' (já vinculado a ' + escHtml(dono) + ')' : ''}</option>`;
+  }).join('');
+  let m = $('modal-vinc'); if (m) m.remove();
+  m = document.createElement('div'); m.className = 'overlay'; m.id = 'modal-vinc';
+  m.innerHTML = `<div class="modal modal-sm">
+    <div class="modal-hd"><div><h2>🔗 Juntar com cadastro de advogado</h2><p>${escHtml(s.nome)} · Assessor(a)</p></div>
+      <button class="btn-icon-sq" onclick="closeModal('modal-vinc')"><svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+    </div>
+    <div class="modal-body">
+      <div class="info-box info" style="margin-bottom:14px">👤 <span>Use quando a mesma pessoa tem os dois cadastros. Ela passa a ter <strong>um só acesso</strong> com as permissões somadas: agenda dos assessores, a própria agenda de advogado e os próprios clientes. Entrando com o e-mail de qualquer dos dois cadastros, cai na mesma conta.</span></div>
+      ${sugerido ? `<div class="info-box success" style="margin-bottom:12px">💡 <span>Sugestão pelo nome ou e-mail: <strong>${escHtml(sugerido.nome)}</strong>.</span></div>` : ''}
+      <div class="field"><label>Cadastro de advogado</label>
+        <select id="vinc-adv"><option value="">— Nenhum (desfazer vínculo) —</option>${opts}</select>
+      </div>
+    </div>
+    <div class="modal-ft">
+      <button class="btn btn-ghost" onclick="closeModal('modal-vinc')">Cancelar</button>
+      <button class="btn btn-red" id="btn-save-vinc" onclick="salvarVinculoAdv()">Salvar</button>
+    </div>
+  </div>`;
+  m.addEventListener('click', e => { if (e.target === m) m.classList.remove('open'); });
+  document.body.appendChild(m);
+  if (!atual && !sugerido) $('vinc-adv').value = '';
+  openModal('modal-vinc');
+}
+async function salvarVinculoAdv(){
+  if (!_vincAlvo || currentUser.tipo !== 'admin') return;
+  const s = store.getAssessor(_vincAlvo); if (!s) return;
+  const advId = $('vinc-adv').value || null;
+  if (advId && store.assessores.some(x => x.id !== s.id && x.perms && x.perms.advVinculado === advId)) { toast('⚠️ Esse advogado já está vinculado a outro assessor'); return; }
+  const perms = { ...(s.perms || {}) };
+  if (advId) perms.advVinculado = advId; else delete perms.advVinculado;
+  btnLoad('btn-save-vinc', true);
+  const { error } = await sb.from('assessores').update({ perms }).eq('id', s.id);
+  if (error) {
+    btnLoad('btn-save-vinc', false);
+    toast(/perms/i.test(error.message || '')
+      ? '❌ Falta a coluna de permissões dos assessores. No Supabase, SQL Editor, rode: alter table assessores add column if not exists perms jsonb default \'{}\'::jsonb;'
+      : '❌ Erro ao salvar: ' + error.message);
+    return;
+  }
+  const adv = advId ? store.getAdv(advId) : null;
+  try { store.addAudit('editado', null, null, adv ? `Vínculo: assessor ${s.nome} = advogado ${adv.nome}` : `Vínculo desfeito: assessor ${s.nome}`); } catch(e){}
+  await store.reload(['assessores']);
+  closeModal('modal-vinc');
+  renderAssessores();
+  toast(adv ? `✅ ${s.nome} agora tem também o acesso de advogado. Vale no próximo carregamento da página dela.` : '✅ Vínculo desfeito');
+}
+
+// ══════════════════════════════════════════════════════════════════
 // ░░ ASSESSORES — CRUD (admin) ░░
 // ══════════════════════════════════════════════════════════════════
 let editAssessorId = null;
@@ -6584,10 +6737,12 @@ function renderAssessores() {
       <div class="adv-stats">
         <div class="adv-stat"><strong style="color:var(--purple)">${abertos}</strong><span>Prazos em aberto (grupo)</span></div>
       </div>
-      <div style="font-size:11px;color:var(--gray-600);margin:-4px 0 12px">👁 Vê clientes de: <strong>${escHtml(resumoAdvsVisiveis({ tipo:'assessor', perms:a.perms }))}</strong></div>
+      <div style="font-size:11px;color:var(--gray-600);margin:-4px 0 12px">👁 Vê clientes de: <strong>${escHtml(resumoAdvsVisiveis({ tipo:'assessor', perms:a.perms, advId:(a.perms||{}).advVinculado }))}</strong></div>
+      ${(a.perms && a.perms.advVinculado && store.getAdv(a.perms.advVinculado)) ? `<div style="font-size:11px;margin:-6px 0 12px;color:var(--success);font-weight:600">🔗 Também advogado(a): ${escHtml(store.getAdv(a.perms.advVinculado).nome)}</div>` : ''}
       <div class="adv-card-ft">
         <button class="btn btn-ghost btn-sm" style="flex:1" onclick="openEditAssessor('${a.id}')">✏️ Editar</button>
         <button class="btn btn-ghost btn-sm" onclick="abrirAdvsVisiveis('assessor','${a.id}')" title="Clientes de quais advogados pode ver">🔐 Advogados</button>
+        <button class="btn btn-ghost btn-sm" onclick="abrirVinculoAdv('${a.id}')" title="Juntar com um cadastro de advogado (mesma pessoa)">🔗</button>
         <button class="btn btn-danger-soft btn-sm" onclick="confirmDelAssessor('${a.id}')">🗑️</button>
       </div>
     </div>`;
@@ -6684,8 +6839,9 @@ function agendaViews(){
   }
   const perAdv = store.advogados.map(a => ({ key:'adv:'+a.id, label:'⚖️ '+a.nome, scope:'advogado', advId:a.id }));
   if (u.tipo === 'assessor')
-    return [{ key:'assessores', label:'👥 Assessores (todos)', scope:'assessores' },
-            { key:'trabalhos', label:'📋 Trabalhos (sem prazo)', scope:'trabalhos' }].concat(perAssessor);
+    return (u.advId ? [{ key:'adv:'+u.advId, label:'⚖️ Minha agenda de advogado(a)', scope:'advogado', advId:u.advId }] : [])
+      .concat([{ key:'assessores', label:'👥 Assessores (todos)', scope:'assessores' },
+            { key:'trabalhos', label:'📋 Trabalhos (sem prazo)', scope:'trabalhos' }], perAssessor);
   if (u.tipo === 'estagiario_chefe')
     return [{ key:'assessores', label:'👥 Assessores (todos)', scope:'assessores' }].concat(perAssessor).concat(perAdv);
   if (u.tipo === 'secretaria')
@@ -6802,6 +6958,7 @@ function agOwnerSelectConfig(){
   if (u.tipo === 'advogado') return { show:false, options:[] };
   const opts = [];
   if (['admin','secretaria','estagiario','estagiario_chefe'].includes(u.tipo)) store.advogados.forEach(a => opts.push({ value:'adv:'+a.id, label:'⚖️ '+a.nome }));
+  else if (u.tipo === 'assessor' && u.advId) { const a = store.getAdv(u.advId); if (a) opts.push({ value:'adv:'+a.id, label:'⚖️ '+a.nome+' (minha agenda de advogado)' }); }
   store.assessores.forEach(a => opts.push({ value:'ass:'+a.id, label:'👥 '+a.nome }));
   opts.push({ value:'ass:none', label:'👥 Sem responsável (assessores)' });
   return { show:true, options:opts };
@@ -6833,7 +6990,7 @@ function agSetupOwner(item){
 function agCanEdit(item){
   const u = currentUser; if (!u) return false;
   if (u.tipo === 'admin') return true;
-  if (u.tipo === 'assessor') return item.escopo === 'assessores' || item.escopo === 'trabalhos';
+  if (u.tipo === 'assessor') return item.escopo === 'assessores' || item.escopo === 'trabalhos' || (!!u.advId && item.escopo === 'advogado' && item.adv_id === u.advId);
   if (u.tipo === 'estagiario_chefe') return item.escopo === 'assessores' || item.escopo === 'advogado';
   if (u.tipo === 'advogado') return item.escopo === 'advogado' && item.adv_id === u.advId;
   if (u.tipo === 'estagiario') return item.escopo === 'advogado' || item.escopo === 'assessores';
@@ -6896,7 +7053,7 @@ function renderAgenda(){
 
   // Legenda de cores (só quando há mais de um dono na tela)
   const donos = new Map();
-  wk.forEach(t => { const k = agDonoChave(t); if (!donos.has(k)) donos.set(k, { cor: agDonoCor(t), nome: agDonoCurto(t) }); });
+  wk.forEach(t => { const cor = agDonoCor(t), nome = agDonoCurto(t), k = cor === '#9898A3' ? 'cinza:' + nome : cor; if (!donos.has(k)) donos.set(k, { cor, nome }); });
   const legenda = donos.size > 1 ? `<div class="agl">${[...donos.values()].map(d => `<span class="agl-i"><i style="background:${d.cor}"></i>${escHtml(d.nome)}</span>`).join('')}</div>` : '';
 
   cont.innerHTML = `
@@ -6996,10 +7153,24 @@ function _agCandidatasCor(){
   return (_agCandidatas = out);
 }
 function agCorPessoa(chave){
-  const pessoas = store.advogados.map(a => ({ k: 'adv:' + a.id, t: a.created_at || '' }))
-    .concat(store.assessores.map(a => ({ k: 'ass:' + a.id, t: a.created_at || '' })))
-    .sort((x, y) => String(x.t).localeCompare(String(y.t)) || x.k.localeCompare(y.k));
-  const sig = pessoas.map(p => p.k).join('|');
+  // A mesma pessoa pode estar cadastrada como advogada e como assessora: os dois cadastros
+  // são reconhecidos como uma pessoa só (mesmo e-mail ou mesmo nome completo) e dividem a cor.
+  const ident = r => {
+    const em = String(r.email || '').trim().toLowerCase();
+    const nm = _notifNorm(r.nome).replace(/^(dr|dra|dr\.|dra\.)\s+/, '').replace(/\s+/g, ' ').trim();
+    return { em, nm };
+  };
+  const regs = store.advogados.map(a => ({ k: 'adv:' + a.id, t: a.created_at || '', ...ident(a) }))
+    .concat(store.assessores.map(a => ({ k: 'ass:' + a.id, t: a.created_at || '', link: (a.perms && a.perms.advVinculado) ? 'adv:' + a.perms.advVinculado : '', ...ident(a) })));
+  const grupos = [];
+  regs.forEach(r => {
+    const g = grupos.find(g => g.regs.some(o => (r.em && o.em === r.em) || (r.nm && o.nm === r.nm) || (r.link && r.link === o.k)));
+    if (g) { g.regs.push(r); if (String(r.t) < String(g.t)) g.t = r.t; }
+    else grupos.push({ t: r.t, regs: [r] });
+  });
+  grupos.forEach(g => g.k = g.regs.map(r => r.k).sort()[0]);
+  const pessoas = grupos.sort((x, y) => String(x.t).localeCompare(String(y.t)) || x.k.localeCompare(y.k));
+  const sig = pessoas.map(p => p.regs.map(r => r.k).join('+')).join('|');
   if (sig !== _agCoresCache.sig) {
     const cand = _agCandidatasCor(), usadas = [], mapa = {};
     const cinza = _agRgbLab([152,152,163]), vermelhoMarca = _agRgbLab([200,16,46]);
@@ -7015,7 +7186,7 @@ function agCorPessoa(chave){
         if (d > melhorD) { melhorD = d; melhor = c; }
       });
       if (!melhor) melhor = { css: `hsl(${Math.round(i * 137.508) % 360}, 70%, 38%)`, lab: [0,0,0] };
-      usadas.push(melhor); mapa[p.k] = melhor.css;
+      usadas.push(melhor); p.regs.forEach(r => { mapa[r.k] = melhor.css; });
     });
     _agCoresCache = { sig, mapa };
   }
@@ -7361,21 +7532,19 @@ async function rejeitarAgenda(id){
 (function agendaRealtime(){
   try {
     sb.channel('mz-agenda-rt')
-      .on('postgres_changes', { event:'*', schema:'public', table:'agenda' }, async () => {
-        await store.reload(['agenda']);
-        if ($('page-agenda')?.classList.contains('active')) renderAgenda();
+      .on('postgres_changes', { event:'*', schema:'public', table:'agenda' }, payload => {
+        if (!currentUser) return;
+        const mudou = payload.eventType === 'DELETE' ? store.aplicar('agenda', [], [payload.old && payload.old.id]) : store.aplicar('agenda', [payload.new]);
+        if (mudou && $('page-agenda')?.classList.contains('active') && !document.querySelector('.overlay.open')) agendarRender('agenda');
       })
       .on('postgres_changes', { event:'*', schema:'public', table:'assessores' }, async () => {
         await store.reload(['assessores']);
         if ($('page-assessores')?.classList.contains('active')) renderAssessores();
       })
-      .on('postgres_changes', { event:'*', schema:'public', table:'clientes' }, async () => {
+      .on('postgres_changes', { event:'*', schema:'public', table:'clientes' }, payload => {
         if (!currentUser) return;
-        await store.reload(['clientes']);
-        if ($('page-clientes')?.classList.contains('active')) renderClients();
-        if ($('page-dashboard')?.classList.contains('active')) renderDashboard();
-        if ($('page-agenda')?.classList.contains('active')) renderAgenda();
-        updateBadges();
+        const mudou = payload.eventType === 'DELETE' ? store.aplicar('clientes', [], [payload.old && payload.old.id]) : store.aplicar('clientes', [payload.new]);
+        if (mudou && !document.querySelector('.overlay.open')) agendarRender('clientes');
       })
       .subscribe();
   } catch(e){ /* realtime opcional */ }
@@ -7388,32 +7557,49 @@ async function rejeitarAgenda(id){
 // ══════════════════════════════════════════════════════════════════
 let _pollSig = {};
 function _pollSigCalc(arr){ return (arr||[]).length + '|' + (arr||[]).map(x => (x.id||'') + '~' + (x.atualizado_em || x.criado_em || x.created_at || x.usado || x.status || '')).join(';'); }
+// Redesenho agrupado: várias mudanças seguidas viram um só redesenho
+let _renderTimer = null, _renderPend = new Set();
+function agendarRender(origem){
+  _renderPend.add(origem);
+  clearTimeout(_renderTimer);
+  _renderTimer = setTimeout(async () => {
+    _renderPend.clear();
+    if (!currentUser || document.querySelector('.overlay.open')) return;
+    const id = document.querySelector('.page.active')?.id;
+    if (id === 'page-agenda') renderAgenda();
+    else if (id === 'page-clientes') renderClients();
+    else if (id === 'page-dashboard') await renderDashboard();
+    updateBadges();
+  }, 400);
+}
+let _autoRodando = false;
 async function _autoRefresh(){
+  if (_autoRodando) return;
+  _autoRodando = true;
   try {
-    if (!currentUser) return;
-    if (document.querySelector('.overlay.open')) return; // modal aberto → não mexe
+    if (!currentUser || document.hidden) return;          // aba em segundo plano: não consulta
+    if (document.querySelector('.overlay.open')) return;   // modal aberto → não mexe
     const active = document.querySelector('.page.active'); if (!active) return;
     const id = active.id;
     if (id === 'page-agenda') {
-      await store.reload(['agenda','assessores','clientes']);
-      const s = _pollSigCalc(store.agenda) + '#' + store.clientes.map(c => c.id + c.status + (c.data_prescricao||'') + (c.adv_id||'')).join(';');
-      if (s !== _pollSig.agenda){ _pollSig.agenda = s; renderAgenda(); }
+      const [m1, m2] = await Promise.all([store.sync('agenda'), store.sync('clientes')]);
+      if (m1 || m2) renderAgenda();
     } else if (id === 'page-assessores') {
-      await store.reload(['assessores','agenda']);
-      const s = _pollSigCalc(store.assessores) + _pollSigCalc(store.agenda); if (s !== _pollSig.ass){ _pollSig.ass = s; renderAssessores(); }
+      await store.reload(['assessores']); const m = await store.sync('agenda');
+      const s = _pollSigCalc(store.assessores); if (m || s !== _pollSig.ass){ _pollSig.ass = s; renderAssessores(); }
     } else if (id === 'page-clientes') {
-      await store.reload(['clientes']);
-      const s = _pollSigCalc(store.clientes); if (s !== _pollSig.cli){ _pollSig.cli = s; renderClients(); updateBadges(); }
+      if (await store.sync('clientes')) { renderClients(); updateBadges(); }
     } else if (id === 'page-dashboard') {
-      await store.reload(['clientes']);
-      const s = _pollSigCalc(store.clientes); if (s !== _pollSig.dash){ _pollSig.dash = s; await renderDashboard(); }
+      if (await store.sync('clientes')) { await renderDashboard(); updateBadges(); }
     } else if (id === 'page-preentrevistas') {
       await store.reload(['tokens']);
       const s = _pollSigCalc(store.tokens); if (s !== _pollSig.tok){ _pollSig.tok = s; renderPreEntrevistas(); }
     }
   } catch(e) { /* silencioso */ }
+  finally { _autoRodando = false; }
 }
-setInterval(_autoRefresh, 10000);
+setInterval(_autoRefresh, 15000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) _autoRefresh(); });
 
 // ══════════════════════════════════════════════════════════════════
 // ░░ NOTIFICAÇÕES NO COMPUTADOR (Windows / Mac, via navegador) ░░
@@ -7468,7 +7654,7 @@ function _notifAgendasDisponiveis(){
     case 'estagiario_chefe':
     case 'estagiario':
     case 'secretaria':       return advs.concat(asss, [semResp]);
-    case 'assessor':         return asss.concat([semResp]);
+    case 'assessor':         return (u.advId ? [{ key:'adv:' + u.advId, lbl:'⚖️ Minha agenda de advogado(a)' }] : []).concat(asss, [semResp]);
     case 'advogado':         return [{ key:'adv:' + u.advId, lbl:'⚖️ Minha agenda' }];
   }
   return [];
@@ -7477,7 +7663,7 @@ function _notifAgendasDisponiveis(){
 function _notifAgendasPadrao(){
   const u = currentUser; const todas = _notifAgendasDisponiveis().map(a => a.key);
   if (u.tipo === 'estagiario') return u.advId ? ['adv:' + u.advId] : [];
-  if (u.tipo === 'assessor')   return ['ass:' + u.id, 'ass:none'];
+  if (u.tipo === 'assessor')   return ['ass:' + u.id, 'ass:none'].concat(u.advId ? ['adv:' + u.advId] : []);
   return todas;
 }
 function _notifPrefs(){
@@ -7558,7 +7744,7 @@ function _notifPodeVer(t){
   switch (u.tipo) {
     case 'admin':            return true;
     case 'advogado':         return t.escopo === 'advogado' && t.adv_id === u.advId;
-    case 'assessor':         return t.escopo === 'assessores' || t.escopo === 'trabalhos';
+    case 'assessor':         return t.escopo === 'assessores' || t.escopo === 'trabalhos' || (!!u.advId && t.escopo === 'advogado' && t.adv_id === u.advId);
     case 'estagiario':       return t.escopo === 'advogado' || t.escopo === 'assessores';
     case 'estagiario_chefe': return t.escopo === 'assessores' || t.escopo === 'advogado';
     case 'secretaria':       return t.tipo === 'audiencia' || t.tipo === 'cliente';
