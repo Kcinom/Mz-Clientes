@@ -663,6 +663,7 @@ body:has(#pre-screen[style*="flex"]) #app { display: none !important; }
       </p>
 
       <p style="margin-top:16px;font-size:11px;color:var(--gray-400);text-align:center"><a href="#" onclick="showSetup()" style="color:var(--info)">Configurar banco de dados</a></p>
+      <p style="margin-top:6px;font-size:10px;color:var(--gray-200);text-align:center">versão 06/11/2026 17h</p>
     </div>
   </div>
 </div>
@@ -2248,11 +2249,43 @@ const store = {
   },
   _guardar(t, data) { if (t === 'audit_log') this.auditLog = data; else this[t] = data; },
 
+  // Abertura rápida: entra assim que chegam as tabelas pequenas e os 1.000 clientes mais recentes;
+  // os clientes mais antigos continuam chegando em segundo plano.
+  _clientesCompletos: true,
   async load() {
-    const tabs = ['advogados','secretarias','estagiarios','estagiarios_chefes','clientes','tokens','audit_log','tarefas','assessores','agenda','feriados_locais'];
-    const res = await Promise.all(tabs.map(t => this._buscarTudo(t)));
+    const tabs = ['advogados','secretarias','estagiarios','estagiarios_chefes','tokens','audit_log','tarefas','assessores','agenda','feriados_locais'];
+    const PAG = 1000;
+    const [res, prim] = await Promise.all([
+      Promise.all(tabs.map(t => this._buscarTudo(t))),
+      this._comLimite(this._consulta('clientes').range(0, PAG - 1), 45000, 'clientes')
+    ]);
     tabs.forEach((t, i) => this._guardar(t, res[i]));
-    ['clientes','agenda'].forEach(t => this._marcarSync(t));
+    this._marcarSync('agenda');
+    if (prim.error) { this._falhasCarga.push('clientes: ' + prim.error.message); this.clientes = []; this._clientesCompletos = true; return; }
+    this.clientes = prim.data || [];
+    if (this.clientes.length < PAG) { this._clientesCompletos = true; this._marcarSync('clientes'); }
+    else { this._clientesCompletos = false; this._continuarClientes(PAG); }   // sem await: segue em segundo plano
+  },
+  async _continuarClientes(de){
+    const PAG = 1000, extra = [], vistos = new Set(this.clientes.map(c => c.id));
+    _indicadorFundo(this.clientes.length);
+    try {
+      for (; de < 100000; de += PAG) {
+        const { data, error } = await this._comLimite(this._consulta('clientes').range(de, de + PAG - 1), 45000, 'clientes');
+        if (error) { toast('⚠️ Nem todos os clientes carregaram: ' + error.message + '. Recarregue a página (F5).'); break; }
+        const pag = data || []; let novos = 0;
+        pag.forEach(r => { if (r && !vistos.has(r.id)) { vistos.add(r.id); extra.push(r); novos++; } });
+        _indicadorFundo(this.clientes.length + extra.length);
+        if (pag.length < PAG || novos === 0) break;
+      }
+    } finally {
+      const ja = new Set(this.clientes.map(c => c.id));
+      this.clientes = this.clientes.concat(extra.filter(r => !ja.has(r.id)));
+      this._clientesCompletos = true;
+      this._marcarSync('clientes');
+      _indicadorFundo(null);
+      if (typeof agendarRender === 'function') agendarRender('clientes');
+    }
   },
 
   async reload(tables = ['clientes']) {
@@ -2272,6 +2305,7 @@ const store = {
   // Devolve true se algo mudou. Recarga completa a cada 5 min (pega exclusões);
   // sem a coluna atualizado_em, recarrega tudo no máximo a cada 60 s.
   async sync(t) {
+    if (t === 'clientes' && !this._clientesCompletos) return false;
     const st = this._sync[t] || {};
     const agora = Date.now();
     const assinatura = () => (this[t] || []).length;
@@ -2402,6 +2436,13 @@ const openModal  = id => { const m = $(id); if (m){ _resetBtns(m); m.classList.a
 const closeModal = id => { const m = $(id); if (m){ _resetBtns(m); m.classList.remove('open'); } };
 document.querySelectorAll('.overlay').forEach(o => o.addEventListener('click', e => { if (e.target === o) o.classList.remove('open'); }));
 
+function _indicadorFundo(n){
+  let el = $('carga-fundo');
+  if (n === null) { if (el) el.remove(); return; }
+  if (!el) { el = document.createElement('div'); el.id = 'carga-fundo'; el.style.cssText = 'position:fixed;left:24px;bottom:24px;z-index:8000;background:var(--gray-900);color:#fff;font-size:12px;font-weight:600;padding:9px 14px;border-radius:99px;box-shadow:var(--sh-lg);display:flex;gap:8px;align-items:center'; document.body.appendChild(el); }
+  el.innerHTML = '<div class="btn-spinner"></div> Carregando clientes mais antigos… ' + n.toLocaleString('pt-BR');
+}
+let _cronoCarga = null;
 function _progressoCarga(n){ const el = $('loading-msg'); if (el && $('loading-overlay').classList.contains('show')) el.textContent = 'Carregando clientes… ' + n.toLocaleString('pt-BR'); }
 // Se qualquer erro inesperado acontecer com a tela de carregamento aberta, ela é fechada e o motivo aparece
 window.addEventListener('error', e => { const o = $('loading-overlay'); if (o && o.classList.contains('show')) { o.classList.remove('show'); toast('❌ Erro ao abrir: ' + (e.message || 'desconhecido')); } });
@@ -2410,6 +2451,8 @@ function loading(show, msg = 'Salvando…') {
   const el = $('loading-overlay');
   el.classList.toggle('show', show);
   $('loading-msg').textContent = msg;
+  clearInterval(_cronoCarga);
+  if (show) { const ini = Date.now(); _cronoCarga = setInterval(() => { const s = Math.round((Date.now() - ini) / 1000); if (s >= 3) $('loading-msg').textContent = msg.replace(/…$/, '') + '… ' + s + 's'; }, 1000); }
 }
 function btnLoad(id, isLoading) {
   const btn = $(id); if (!btn) return;
@@ -3439,6 +3482,7 @@ async function generatePDF(clientId) {
 // CLIENTS LIST
 // ══════════════════════════════════════════════════════════════════
 function renderClients() {
+  _cliBlocos = {};
   let list = store.forUser(currentUser);
   const q   = $('search-input').value.toLowerCase();
   const srt = $('filter-sort').value;
@@ -3469,23 +3513,51 @@ function renderClients() {
   if (presc.length) html += statusBlock('prescrito',   'Prescritos',             presc, 'Prescrição');
   if (rej.length)   html += statusBlock('rejeitado',   'Rejeitados',             rej,   'Motivo');
   cont.innerHTML = html;
+  _cliAtivarRolagem();
 }
 
 // Cada bloco desenha no máximo CLI_POR_BLOCO linhas; o resto vem em "Mostrar mais".
 // Desenhar mais de mil linhas de uma vez é o que deixava a tela lenta.
 const CLI_POR_BLOCO = 100;
+const CLI_POR_GRUPO = 25;   // na visão agrupada há muitos blocos: cada um começa menor
 let _cliLimite = {};
-function _cliMais(chaveCod){ const chave = decodeURIComponent(chaveCod); _cliLimite[chave] = (_cliLimite[chave] || CLI_POR_BLOCO) + 200; renderClients(); }
+// Rolagem infinita: cada bloco começa com CLI_POR_BLOCO linhas e, ao se aproximar do fim,
+// as próximas são acrescentadas sozinhas, sem redesenhar o que já está na tela.
+let _cliBlocos = {}, _cliObserver = null;
+function _cliRegistrar(chave, list, st){ _cliBlocos[chave] = { list, st }; }
+function _cliCarregarMais(sent){
+  let voltas = 0;
+  while (sent.isConnected && voltas++ < 5) {
+    const chave = decodeURIComponent(sent.dataset.chave), b = _cliBlocos[chave];
+    if (!b) { sent.remove(); return; }
+    const lim = _cliLimite[chave] || (chave.startsWith('gr:') ? CLI_POR_GRUPO : CLI_POR_BLOCO);
+    const novos = b.list.slice(lim, lim + CLI_POR_BLOCO);
+    sent.insertAdjacentHTML('beforebegin', novos.map(c => clientRow(c, b.st)).join(''));
+    _cliLimite[chave] = lim + novos.length;
+    const resta = b.list.length - _cliLimite[chave];
+    if (resta <= 0) { if (_cliObserver) _cliObserver.unobserve(sent); sent.remove(); return; }
+    sent.textContent = `Carregando mais… (${resta} restantes)`;
+    if (sent.getBoundingClientRect().top > window.innerHeight + 800) return;   // já saiu da área visível
+  }
+}
+function _cliAtivarRolagem(){
+  if (_cliObserver) _cliObserver.disconnect();
+  const sents = document.querySelectorAll('#clients-container .cli-sent');
+  if (!sents.length) return;
+  if (!('IntersectionObserver' in window)) { sents.forEach(s => { s.style.cursor = 'pointer'; s.onclick = () => _cliCarregarMais(s); }); return; }
+  _cliObserver = new IntersectionObserver(ents => ents.forEach(e => { if (e.isIntersecting) _cliCarregarMais(e.target); }), { rootMargin: '0px 0px 800px 0px' });
+  sents.forEach(s => _cliObserver.observe(s));
+}
 // Busca: espera a pessoa parar de digitar antes de redesenhar a lista
 let _cliBuscaTimer = null;
 function _cliBuscaDigitada(){ clearTimeout(_cliBuscaTimer); _cliBuscaTimer = setTimeout(() => { _cliLimite = {}; renderClients(); }, 250); }
 function _cliRodape(chave, total, lim){
   if (total <= lim) return '';
-  return `<div style="padding:12px;text-align:center;border-top:1px solid var(--gray-100)">
-    <button class="btn btn-ghost btn-sm" onclick="_cliMais('${encodeURIComponent(chave).replace(/'/g, '%27')}')">Mostrar mais ${Math.min(200, total - lim)} de ${total - lim} restantes</button></div>`;
+  return `<div class="cli-sent" data-chave="${encodeURIComponent(chave)}" style="padding:14px;text-align:center;font-size:12px;color:var(--gray-400);border-top:1px solid var(--gray-100)">Carregando mais… (${total - lim} restantes)</div>`;
 }
 function statusBlock(st, title, list, col4) {
   const lim = _cliLimite['st:' + st] || CLI_POR_BLOCO;
+  _cliRegistrar('st:' + st, list, st);
   return `<div class="clients-block">
     <div class="block-head ${st}"><h3>${title}</h3><span class="badge ${stBadge(st)}">${list.length}</span></div>
     <div class="tbl-wrap">
@@ -3506,9 +3578,10 @@ function renderGrouped(list, by, cont) {
     <div class="clients-block">
       <div class="block-head grouped"><h3>${k}</h3><span class="badge b-gray">${groups[k].length}</span></div>
       <div class="tbl-wrap"><div class="tbl-head"><span>Cliente</span><span>Reclamada / Função</span><span>Tipo Rescisão</span><span>Prescrição</span><span>Urgência</span><span>Advogado</span><span></span></div>
-      ${groups[k].slice(0, _cliLimite['gr:' + k] || CLI_POR_BLOCO).map(c => clientRow(c)).join('')}
-      ${_cliRodape('gr:' + k, groups[k].length, _cliLimite['gr:' + k] || CLI_POR_BLOCO)}
+      ${(_cliRegistrar('gr:' + k, groups[k]), '')}${groups[k].slice(0, _cliLimite['gr:' + k] || CLI_POR_GRUPO).map(c => clientRow(c)).join('')}
+      ${_cliRodape('gr:' + k, groups[k].length, _cliLimite['gr:' + k] || CLI_POR_GRUPO)}
     </div></div>`).join('');
+  _cliAtivarRolagem();
 }
 
 function clientRow(c, ost) {
@@ -7611,6 +7684,7 @@ async function _autoRefresh(){
   _autoRodando = true;
   try {
     if (!currentUser || document.hidden) return;          // aba em segundo plano: não consulta
+    if ($('app').style.display !== 'block' || window._bootEmCurso) return;   // ainda abrindo: não concorre com a carga
     if (document.querySelector('.overlay.open')) return;   // modal aberto → não mexe
     const active = document.querySelector('.page.active'); if (!active) return;
     const id = active.id;
