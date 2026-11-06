@@ -663,7 +663,7 @@ body:has(#pre-screen[style*="flex"]) #app { display: none !important; }
       </p>
 
       <p style="margin-top:16px;font-size:11px;color:var(--gray-400);text-align:center"><a href="#" onclick="showSetup()" style="color:var(--info)">Configurar banco de dados</a></p>
-      <p style="margin-top:6px;font-size:10px;color:var(--gray-200);text-align:center">versão 06/11/2026 17h</p>
+      <p style="margin-top:6px;font-size:10px;color:var(--gray-200);text-align:center">versão 06/11/2026 17h25</p>
     </div>
   </div>
 </div>
@@ -2230,14 +2230,19 @@ const store = {
   _falhasCarga: [],
   async _buscarTudo(t) {
     if (t === 'audit_log') {
-      const { data, error } = await this._comLimite(this._consulta(t), 20000, t);
-      if (error) this._falhasCarga.push(t + ': ' + error.message);
+      const { data, error } = await this._comLimite(this._consulta(t), 30000, t);
+      if (error) { this._falhasCarga.push(t + ': ' + error.message); const v = []; v._incompleto = true; return v; }
       return data || [];
     }
-    const PAG = 1000; const todos = []; const vistos = new Set();
+    const PAG = 500; const todos = []; const vistos = new Set();
     for (let de = 0; de < 100000; de += PAG) {
-      const { data, error } = await this._comLimite(this._consulta(t).range(de, de + PAG - 1), 30000, t);
-      if (error) { console.warn('[carga]', t, error.message); if (!/does not exist|42P01/i.test(error.message || '')) this._falhasCarga.push(t + ': ' + error.message); break; }
+      const { data, error } = await this._comLimite(this._consulta(t).range(de, de + PAG - 1), 60000, t);
+      if (error) {
+        console.warn('[carga]', t, error.message);
+        const tabelaInexistente = /does not exist|42P01|PGRST205|could not find the table/i.test((error.message || '') + ' ' + (error.code || ''));
+        if (!tabelaInexistente) { this._falhasCarga.push(t + ': ' + error.message); todos._incompleto = true; }
+        break;
+      }
       const pag = data || [];
       let novos = 0;
       pag.forEach(r => { const k = r && r.id; if (k == null || !vistos.has(k)) { if (k != null) vistos.add(k); todos.push(r); novos++; } });
@@ -2252,31 +2257,56 @@ const store = {
   // Abertura rápida: entra assim que chegam as tabelas pequenas e os 1.000 clientes mais recentes;
   // os clientes mais antigos continuam chegando em segundo plano.
   _clientesCompletos: true,
+  _fundoCompleto: true,
+  // Abertura rápida: espera só o essencial (equipe, agenda, feriados e os 500 clientes mais recentes).
+  // O resto (clientes antigos, links de pré-entrevista, tarefas e auditoria) chega em segundo plano.
   async load() {
-    const tabs = ['advogados','secretarias','estagiarios','estagiarios_chefes','tokens','audit_log','tarefas','assessores','agenda','feriados_locais'];
-    const PAG = 1000;
+    const essenciais = ['advogados','secretarias','estagiarios','estagiarios_chefes','assessores','agenda','feriados_locais'];
+    const fundo = ['tokens','tarefas','audit_log'];
+    const PRIM = 500;
+    const pend = new Set(essenciais.concat(['clientes']));
+    const marca = t => { pend.delete(t); _pendenciasCarga(pend); };
+    _pendenciasCarga(pend);
     const [res, prim] = await Promise.all([
-      Promise.all(tabs.map(t => this._buscarTudo(t))),
-      this._comLimite(this._consulta('clientes').range(0, PAG - 1), 45000, 'clientes')
+      Promise.all(essenciais.map(t => this._buscarTudo(t).then(d => { marca(t); return d; }))),
+      this._comLimite(this._consulta('clientes').range(0, PRIM - 1), 60000, 'clientes').then(r => { marca('clientes'); return r; })
     ]);
-    tabs.forEach((t, i) => this._guardar(t, res[i]));
+    essenciais.forEach((t, i) => this._guardar(t, res[i]));
     this._marcarSync('agenda');
-    if (prim.error) { this._falhasCarga.push('clientes: ' + prim.error.message); this.clientes = []; this._clientesCompletos = true; return; }
-    this.clientes = prim.data || [];
-    if (this.clientes.length < PAG) { this._clientesCompletos = true; this._marcarSync('clientes'); }
-    else { this._clientesCompletos = false; this._continuarClientes(PAG); }   // sem await: segue em segundo plano
+    if (prim.error) { this._falhasCarga.push('clientes: ' + prim.error.message); this.clientes = []; this._clientesCompletos = true; }
+    else {
+      this.clientes = prim.data || [];
+      if (this.clientes.length < PRIM) { this._clientesCompletos = true; this._marcarSync('clientes'); }
+      else this._clientesCompletos = false;
+    }
+    // segundo plano, sem await
+    this._fundoCompleto = false;
+    const tarefasFundo = fundo.map(t => this._buscarTudo(t).then(d => this._guardar(t, d)));
+    if (!this._clientesCompletos) tarefasFundo.push(this._continuarClientes(PRIM));
+    Promise.all(tarefasFundo).finally(() => {
+      this._fundoCompleto = true;
+      if (typeof updateBadges === 'function') updateBadges();
+      if ($('page-preentrevistas')?.classList.contains('active')) renderPreEntrevistas();
+      if (typeof agendarRender === 'function') agendarRender('fundo');
+    });
   },
+  // Clientes mais antigos: 3 páginas de 1.000 por vez, em paralelo
   async _continuarClientes(de){
-    const PAG = 1000, extra = [], vistos = new Set(this.clientes.map(c => c.id));
+    const PAG = 1000, SIMULT = 3, extra = [], vistos = new Set(this.clientes.map(c => c.id));
     _indicadorFundo(this.clientes.length);
     try {
-      for (; de < 100000; de += PAG) {
-        const { data, error } = await this._comLimite(this._consulta('clientes').range(de, de + PAG - 1), 45000, 'clientes');
-        if (error) { toast('⚠️ Nem todos os clientes carregaram: ' + error.message + '. Recarregue a página (F5).'); break; }
-        const pag = data || []; let novos = 0;
-        pag.forEach(r => { if (r && !vistos.has(r.id)) { vistos.add(r.id); extra.push(r); novos++; } });
+      let fim = false;
+      while (!fim && de < 100000) {
+        const lote = await Promise.all(Array.from({ length: SIMULT }, (_, k) =>
+          this._comLimite(this._consulta('clientes').range(de + k * PAG, de + (k + 1) * PAG - 1), 60000, 'clientes')));
+        for (const { data, error } of lote) {
+          if (error) { toast('⚠️ Nem todos os clientes carregaram: ' + error.message + '. Recarregue a página (F5).'); fim = true; break; }
+          const pag = data || []; let novos = 0;
+          pag.forEach(r => { if (r && !vistos.has(r.id)) { vistos.add(r.id); extra.push(r); novos++; } });
+          if (pag.length < PAG || novos === 0) { fim = true; break; }
+        }
         _indicadorFundo(this.clientes.length + extra.length);
-        if (pag.length < PAG || novos === 0) break;
+        de += SIMULT * PAG;
       }
     } finally {
       const ja = new Set(this.clientes.map(c => c.id));
@@ -2290,7 +2320,13 @@ const store = {
 
   async reload(tables = ['clientes']) {
     const res = await Promise.all(tables.map(t => this._buscarTudo(t)));
-    tables.forEach((t, i) => { this._guardar(t, res[i]); if (t === 'clientes' || t === 'agenda') this._marcarSync(t); });
+    tables.forEach((t, i) => {
+      const atual = t === 'audit_log' ? this.auditLog : this[t];
+      // Falha no meio da busca (internet lenta, banco ocupado): mantém o que já estava na tela
+      if (res[i]._incompleto && Array.isArray(atual) && atual.length) { console.warn('[recarga] mantida a lista anterior de', t); return; }
+      this._guardar(t, res[i]);
+      if (t === 'clientes' || t === 'agenda') this._marcarSync(t);
+    });
   },
 
   // ── Atualização incremental: só busca o que mudou desde a última vez (coluna atualizado_em) ──
@@ -2310,7 +2346,7 @@ const store = {
     const agora = Date.now();
     const assinatura = () => (this[t] || []).length;
     if (st.semColuna) {
-      if (agora - (st.full || 0) < 60000) return false;
+      if (agora - (st.full || 0) < 5 * 60000) return false;
       const antes = JSON.stringify(this[t]); await this.reload([t]); return antes !== JSON.stringify(this[t]);
     }
     if (!st.ultimo || agora - (st.full || 0) > 5 * 60000) {
@@ -2443,6 +2479,8 @@ function _indicadorFundo(n){
   el.innerHTML = '<div class="btn-spinner"></div> Carregando clientes mais antigos… ' + n.toLocaleString('pt-BR');
 }
 let _cronoCarga = null;
+const _NOMES_TAB = { advogados:'advogados', secretarias:'secretárias', estagiarios:'estagiários', estagiarios_chefes:'estagiários chefes', assessores:'assessores', agenda:'agenda', feriados_locais:'feriados', clientes:'clientes' };
+function _pendenciasCarga(pend){ window._cargaPend = [...pend].map(t => _NOMES_TAB[t] || t); }
 function _progressoCarga(n){ const el = $('loading-msg'); if (el && $('loading-overlay').classList.contains('show')) el.textContent = 'Carregando clientes… ' + n.toLocaleString('pt-BR'); }
 // Se qualquer erro inesperado acontecer com a tela de carregamento aberta, ela é fechada e o motivo aparece
 window.addEventListener('error', e => { const o = $('loading-overlay'); if (o && o.classList.contains('show')) { o.classList.remove('show'); toast('❌ Erro ao abrir: ' + (e.message || 'desconhecido')); } });
@@ -2452,7 +2490,7 @@ function loading(show, msg = 'Salvando…') {
   el.classList.toggle('show', show);
   $('loading-msg').textContent = msg;
   clearInterval(_cronoCarga);
-  if (show) { const ini = Date.now(); _cronoCarga = setInterval(() => { const s = Math.round((Date.now() - ini) / 1000); if (s >= 3) $('loading-msg').textContent = msg.replace(/…$/, '') + '… ' + s + 's'; }, 1000); }
+  if (show) { window._cargaPend = []; const ini = Date.now(); _cronoCarga = setInterval(() => { const s = Math.round((Date.now() - ini) / 1000); if (s >= 2) { const p = window._cargaPend || []; $('loading-msg').textContent = msg.replace(/…$/, '') + '… ' + s + 's' + (p.length && p.length <= 3 ? ' · aguardando ' + p.join(', ') : ''); } }, 1000); }
 }
 function btnLoad(id, isLoading) {
   const btn = $(id); if (!btn) return;
@@ -2677,6 +2715,14 @@ async function doLogin() {
 
   // ═══ NOVA ESTRATÉGIA: tenta Supabase Auth primeiro, depois fallback legado ═══
 
+  // As consultas do login antigo saem já em paralelo com a tentativa no Supabase Auth,
+  // em vez de uma depois da outra: o login espera uma rodada só.
+  const legado = Promise.all([
+    getAdminCredenciais(),
+    ...['advogados','secretarias','estagiarios','estagiarios_chefes','assessores'].map(t =>
+      sb.from(t).select('*').eq('email', email).eq('senha', pwd).then(r => r, () => ({ data: null })))
+  ]);
+
   // 1. TENTA LOGIN NO SUPABASE AUTH
   try {
     const { data: authData, error: authErr } = await sb.auth.signInWithPassword({ email, password: pwd });
@@ -2720,42 +2766,42 @@ async function doLogin() {
 
   // 2. FALLBACK: LOGIN LEGADO (tabelas diretas) — pra usuários ainda não migrados
 
+  const [admin, rAdv, rSec, rEst, rEstc, rAss] = await legado;
   // Admin com credenciais hardcoded
-  const admin = await getAdminCredenciais();
   if (email === admin.email.toLowerCase() && pwd === admin.senha) {
     currentUser = { tipo: 'admin', nome: admin.nome, email: admin.email, id: 'admin', advId: null };
     await bootApp(); return;
   }
 
-  const { data: advs } = await sb.from('advogados').select('*').eq('email', email).eq('senha', pwd);
+  const advs = rAdv.data;
   if (advs && advs.length) {
     const a = advs[0];
     currentUser = { tipo: 'advogado', nome: a.nome, email: a.email, id: a.id, advId: a.id, oab: a.oab || '' };
     await bootApp(); return;
   }
 
-  const { data: secs } = await sb.from('secretarias').select('*').eq('email', email).eq('senha', pwd);
+  const secs = rSec.data;
   if (secs && secs.length) {
     const s = secs[0];
     currentUser = { tipo: 'secretaria', nome: s.nome, email: s.email, id: s.id, perms: s.perms || {} };
     await bootApp(); return;
   }
 
-  const { data: ests } = await sb.from('estagiarios').select('*').eq('email', email).eq('senha', pwd);
+  const ests = rEst.data;
   if (ests && ests.length) {
     const e = ests[0];
     currentUser = { tipo: 'estagiario', nome: e.nome, email: e.email, id: e.id, advId: e.adv_id, perms: e.perms || {} };
     await bootApp(); return;
   }
 
-  const { data: estcs } = await sb.from('estagiarios_chefes').select('*').eq('email', email).eq('senha', pwd);
+  const estcs = rEstc.data;
   if (estcs && estcs.length) {
     const ec = estcs[0];
     currentUser = { tipo: 'estagiario_chefe', nome: ec.nome, email: ec.email, id: ec.id, perms: ec.perms || {} };
     await bootApp(); return;
   }
 
-  const { data: asss } = await sb.from('assessores').select('*').eq('email', email).eq('senha', pwd);
+  const asss = rAss.data;
   if (asss && asss.length) {
     const as = asss[0];
     currentUser = { tipo: 'assessor', nome: as.nome, email: as.email, id: as.id, advId: null, perms: as.perms || {} };
@@ -2924,6 +2970,14 @@ async function bootApp() {
   loading(false);
   if (store._falhasCarga.length) {
     setTimeout(() => toast('⚠️ Parte dos dados não carregou: ' + store._falhasCarga.slice(0, 2).join(' | ') + '. Recarregue a página (F5).'), 800);
+  }
+  // Banco fora do ar (projeto pausado, limite do plano, rede): aviso fixo, para não parecer que os dados sumiram
+  if (store._falhasCarga.some(f => /^(clientes|advogados|agenda)/.test(f))) {
+    const b = document.createElement('div');
+    b.id = 'aviso-banco';
+    b.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:9500;background:#7a0019;color:#fff;padding:12px 20px;font-size:13px;line-height:1.5;text-align:center;box-shadow:0 2px 12px rgba(0,0,0,.3)';
+    b.innerHTML = '<strong>O banco de dados não respondeu.</strong> Os dados não foram apagados: o sistema não conseguiu buscá-los. Verifique no painel do Supabase se o projeto está pausado ou acima do limite do plano e recarregue a página. <span style="opacity:.75">(' + escHtml(store._falhasCarga[0]) + ')</span>';
+    document.body.appendChild(b);
   }
   // Atualiza permissões da sessão salva (o admin pode ter mudado desde o último acesso)
   try {
